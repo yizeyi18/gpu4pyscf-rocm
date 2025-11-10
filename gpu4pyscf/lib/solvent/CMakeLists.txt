@@ -23,17 +23,24 @@ add_library(solvent SHARED
 mnsol_interface.f90
 mnsol_mem.F
 mnsol.F
-pcm.cu
+pcm.${GPU4PYSCF_GPU_SOURCE_EXTENSION}
 )
-
-#option(BUILD_SHARED_LIBS "build shared libraries" 1)
-#option(ENABLE_STATIC "Enforce static library build" 0)
-#if(ENABLE_STATIC)
-#  set(BUILD_SHARED_LIBS 0)
-#endif()
 
 set_target_properties(solvent PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR})
-set_target_properties(solvent PROPERTIES 
-  CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 
+if(GPU4PYSCF_USE_HIP)
+  set_source_files_properties(pcm.${GPU4PYSCF_GPU_SOURCE_EXTENSION} PROPERTIES LANGUAGE HIP)
+  set_target_properties(solvent PROPERTIES HIP_ARCHITECTURES "${CMAKE_HIP_ARCHITECTURES}")
+  target_compile_options(solvent PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-fgpu-rdc>)
+  target_link_options(solvent PRIVATE -fgpu-rdc)
+elseif(GPU4PYSCF_USE_CUDA)
+  set_property(TARGET solvent PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+endif()
+
+if(GPU4PYSCF_DEVICE_LIB)
+  target_link_libraries(solvent PRIVATE ${GPU4PYSCF_DEVICE_LIB})
+endif()
+if(GPU4PYSCF_HOST_LIB)
+  target_link_libraries(solvent INTERFACE ${GPU4PYSCF_HOST_LIB})
+endif()

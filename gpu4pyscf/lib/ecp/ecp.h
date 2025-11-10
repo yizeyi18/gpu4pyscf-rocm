@@ -30,6 +30,11 @@
 // Thread number has to be the same as qudrature points
 #define THREADS        128
 
+// Optional: Stream omega one m-plane at a time to reduce LDS footprint in type2 kernels.
+// Define ECP_STREAM_OMEGA to enable the single-m streaming path (keeps data on-chip, saves ~x(2*LC+1) omega storage).
+// You can enable via build flag (e.g., -DECP_STREAM_OMEGA) instead of uncommenting.
+#define ECP_STREAM_OMEGA 1
+
 __constant__
 static int _cart_pow_y[] = {
         0,

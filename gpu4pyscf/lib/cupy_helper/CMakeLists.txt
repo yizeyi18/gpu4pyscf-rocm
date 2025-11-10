@@ -14,30 +14,51 @@
 
 #set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -arch=sm_80")
 
-set(cupy_helper_src
-  transpose.cu
-  block_diag.cu
-  unpack.cu
-  take_last2d.cu
-  async_d2h_2d.cu
-  add_sparse.cu
-  dist_matrix.cu
-  cart2sph.cu
+set(cupy_helper_sources_base
+  transpose
+  block_diag
+  unpack
+  take_last2d
+  async_d2h_2d
+  add_sparse
+  dist_matrix
+  cart2sph
 )
 
 if(BUILD_CUTLASS)
-  set(cupy_helper_src ${cupy_helper_src}
-    grouped_gemm.cu
-    grouped_dot.cu
-  )
+  list(APPEND cupy_helper_sources_base grouped_gemm grouped_dot)
 endif()
 
-add_library(cupy_helper SHARED ${cupy_helper_src})
+set(cupy_helper_sources "")
+foreach(src ${cupy_helper_sources_base})
+  list(APPEND cupy_helper_sources "${src}.${GPU4PYSCF_GPU_SOURCE_EXTENSION}")
+endforeach()
+
+if(GPU4PYSCF_USE_HIP)
+  set_source_files_properties(${cupy_helper_sources} PROPERTIES LANGUAGE HIP)
+endif()
+
+add_library(cupy_helper SHARED ${cupy_helper_sources})
 
 if(BUILD_CUTLASS)
-add_dependencies(cupy_helper cutlass)
-target_include_directories(cupy_helper PRIVATE ${cutlass_SOURCE_DIR}/tools/util/include ${cutlass_SOURCE_DIR}/include)
+    add_dependencies(cupy_helper cutlass)
+    target_include_directories(cupy_helper PRIVATE ${cutlass_SOURCE_DIR}/tools/util/include ${cutlass_SOURCE_DIR}/include)
 endif()
 
 set_target_properties(cupy_helper PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR})
-set_target_properties(cupy_helper PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+if(GPU4PYSCF_USE_HIP)
+  set_target_properties(cupy_helper PROPERTIES HIP_ARCHITECTURES "${CMAKE_HIP_ARCHITECTURES}")
+  set_property(TARGET cupy_helper PROPERTY HIP_SEPARABLE_COMPILATION ON)
+  target_compile_options(cupy_helper PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-fgpu-rdc>)
+  target_link_options(cupy_helper PRIVATE -fgpu-rdc)
+endif()
+if(GPU4PYSCF_USE_CUDA)
+  set_property(TARGET cupy_helper PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+endif()
+
+if(GPU4PYSCF_DEVICE_LIB)
+  target_link_libraries(cupy_helper PRIVATE ${GPU4PYSCF_DEVICE_LIB})
+endif()
+if(GPU4PYSCF_HOST_LIB)
+  target_link_libraries(cupy_helper INTERFACE ${GPU4PYSCF_HOST_LIB})
+endif()

@@ -13,27 +13,49 @@
 # limitations under the License.
 
 # set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --ptxas-options=-v -maxrregcount=128")
+if(GPU4PYSCF_USE_CUDA)
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --ptxas-options=-v")
+endif()
 
-add_library(gvhf SHARED
-  constant.cu
-  #nr_jk_driver.cu
-  nr_jk_driver_int3c2e_ip1.cu
-  nr_jk_driver_int3c2e_ip2.cu
-  nr_jk_driver_int3c2e_pass1.cu
-  nr_jk_driver_int3c2e_pass2.cu
-  #nr_jk_driver_ip1.cu
-  #get_veff_driver_ip1.cu
-  rys_roots_dat.cu
+set(gvhf_gpu_sources_base
+  constant
+  nr_jk_driver_int3c2e_ip1
+  nr_jk_driver_int3c2e_ip2
+  nr_jk_driver_int3c2e_pass1
+  nr_jk_driver_int3c2e_pass2
+  rys_roots_dat
 )
 
-#option(BUILD_SHARED_LIBS "build shared libraries" 1)
-#option(ENABLE_STATIC "Enforce static library build" 0)
-#if(ENABLE_STATIC)
-#  set(BUILD_SHARED_LIBS 0)
-#endif()
+set(gvhf_gpu_sources "")
+foreach(src ${gvhf_gpu_sources_base})
+  list(APPEND gvhf_gpu_sources "${src}.${GPU4PYSCF_GPU_SOURCE_EXTENSION}")
+endforeach()
+
+if(GPU4PYSCF_USE_HIP)
+  set_source_files_properties(${gvhf_gpu_sources} PROPERTIES LANGUAGE HIP)
+endif()
+
+add_library(gvhf SHARED ${gvhf_gpu_sources})
 
 set_target_properties(gvhf PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}
-  CUDA_SEPARABLE_COMPILATION ON)
+)
 
-target_link_libraries(gvhf gint)
+if(GPU4PYSCF_USE_CUDA)
+  set_property(TARGET gvhf PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+endif()
+if(GPU4PYSCF_USE_HIP)
+  set_property(TARGET gvhf PROPERTY HIP_SEPARABLE_COMPILATION ON)
+  target_compile_options(gvhf PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-fgpu-rdc>)
+  target_link_options(gvhf PRIVATE -fgpu-rdc)
+endif()
+
+if(GPU4PYSCF_DEVICE_LIB)
+  target_link_libraries(gvhf PRIVATE ${GPU4PYSCF_DEVICE_LIB} gint)
+else()
+  target_link_libraries(gvhf PRIVATE gint)
+endif()
+
+if(GPU4PYSCF_HOST_LIB)
+  target_link_libraries(gvhf INTERFACE ${GPU4PYSCF_HOST_LIB})
+endif()
