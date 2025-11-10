@@ -16,7 +16,13 @@ import unittest
 import numpy as np
 import scipy.linalg
 import cupy as cp
-from gpu4pyscf.lib.cusolver import eigh, cholesky
+from gpu4pyscf.__config__ import backend
+if backend == "CUDA":
+    from gpu4pyscf.lib.cusolver import eigh, cholesky  #NOQA
+elif backend == "HIP":
+    from gpu4pyscf.lib.rocsolver import eigh, cholesky  #NOQA
+else:
+    raise RuntimeError("Invalid gpu4pyscf backend!")
 
 def test_eigh_real():
     np.random.seed(6)

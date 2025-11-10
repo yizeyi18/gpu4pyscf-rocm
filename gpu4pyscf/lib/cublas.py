@@ -16,8 +16,15 @@
 import ctypes
 from cupy.cuda import device
 from cupy_backends.cuda.libs import cublas #NOQA
+from gpu4pyscf.__config__ import backend
 
-libcublas = ctypes.CDLL('libcublas.so')
+if backend == "CUDA":
+    libcublas = ctypes.CDLL('libcublas.so')
+elif backend == "HIP":
+    libcublas = ctypes.CDLL('librocblas.so')
+else:
+    raise RuntimeError("Invalid gpu4pyscf backend!")
+assert libcublas is not None
 
 # This needs to be moved into functions, and lazy evaluate
 _handle = device.get_cublas_handle() #NOQA

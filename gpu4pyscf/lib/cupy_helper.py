@@ -21,10 +21,15 @@ import cupy
 from pyscf import lib
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib.cutensor import contract
-from gpu4pyscf.lib.cusolver import eigh, cholesky  #NOQA
 from gpu4pyscf.lib.memcpy import copy_array, p2p_transfer  #NOQA
 from gpu4pyscf.lib.multi_gpu import lru_cache
-from gpu4pyscf.__config__ import _streams, num_devices, _p2p_access
+from gpu4pyscf.__config__ import _streams, num_devices, _p2p_access, backend
+if backend == "CUDA":
+    from gpu4pyscf.lib.cusolver import eigh, cholesky  #NOQA
+elif backend == "HIP":
+    from gpu4pyscf.lib.rocsolver import eigh, cholesky  #NOQA
+else:
+    raise RuntimeError("Invalid gpu4pyscf backend!")
 
 LMAX_ON_GPU = 7
 DSOLVE_LINDEP = 1e-13
@@ -447,7 +452,7 @@ def block_diag(blocks, out=None):
         ctypes.cast(cols.data.ptr, ctypes.c_void_p),
     )
     if err != 0:
-        raise RuntimeError('failed in block_diag kernel')
+        raise RuntimeError(f'failed in block_diag kernel, err={err}')
     return out
 
 def take_last2d(a, indices, out=None):

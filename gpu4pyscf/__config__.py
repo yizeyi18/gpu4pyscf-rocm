@@ -28,6 +28,7 @@ min_ao_blksize = 256        # maxisum batch size of AOs
 min_grid_blksize = 64*64    # maximum batch size of grids for DFT
 ao_aligned = 32             # global AO alignment for slicing
 grid_aligned = 256          # 256 alignment for grids globally
+backend = "HIP" if cupy.cuda.runtime.is_hip else "CUDA"
 
 # Use smaller blksize for old gaming GPUs
 if props['totalGlobalMem'] < 16 * GB:
