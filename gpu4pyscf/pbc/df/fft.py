@@ -26,16 +26,22 @@ from pyscf.pbc.df import fft as fft_cpu
 from pyscf.pbc.df import aft as aft_cpu
 from pyscf.pbc.gto import pseudo
 from pyscf.pbc.lib.kpts_helper import is_zero
+from pyscf.pbc.lib.kpts import KPoints
 from gpu4pyscf.lib import logger, utils
 from gpu4pyscf.lib.cupy_helper import contract
 from gpu4pyscf.pbc import tools
 from gpu4pyscf.pbc.df import fft_jk
 from gpu4pyscf.pbc.df.aft import _check_kpts
 from gpu4pyscf.pbc.df.ft_ao import ft_ao
+from gpu4pyscf.pbc.lib.kpts_helper import reset_kpts
 
 def get_nuc(mydf, kpts=None):
     from gpu4pyscf.pbc.dft import numint
-    kpts, is_single_kpt = _check_kpts(mydf, kpts)
+    is_single_kpt = kpts is not None and kpts.ndim == 1
+    if kpts is None:
+        kpts = np.zeros((1, 3))
+    else:
+        kpts = kpts.reshape(-1, 3)
     cell = mydf.cell
     assert cell.low_dim_ft_type != 'inf_vacuum'
     assert cell.dimension > 1
@@ -68,7 +74,11 @@ def get_pp(mydf, kpts=None):
     '''Get the periodic pseudopotential nuc-el AO matrix, with G=0 removed.
     '''
     from gpu4pyscf.pbc.dft import numint
-    kpts, is_single_kpt = _check_kpts(mydf, kpts)
+    is_single_kpt = kpts is not None and kpts.ndim == 1
+    if kpts is None:
+        kpts = np.zeros((1, 3))
+    else:
+        kpts = kpts.reshape(-1, 3)
     cell = mydf.cell
     assert cell.low_dim_ft_type != 'inf_vacuum'
     assert cell.dimension > 1
@@ -207,14 +217,14 @@ class FFTDF(lib.StreamObject):
 
     _keys = fft_cpu.FFTDF._keys
 
-    def __init__(self, cell, kpts=np.zeros((1,3))):
+    def __init__(self, cell, kpts=None):
         from gpu4pyscf.pbc.dft import numint
         self.cell = cell
         self.stdout = cell.stdout
         self.verbose = cell.verbose
         self.max_memory = cell.max_memory
-        self.kpts = kpts
         self.mesh = cell.mesh
+        self.kpts = kpts
 
         # The following attributes are not input options.
         # self.exxdiv has no effects. It was set in the get_k_kpts function to
@@ -222,6 +232,9 @@ class FFTDF(lib.StreamObject):
         self.exxdiv = None
         self._numint = numint.KNumInt()
         self._rsh_df = {}  # Range separated Coulomb DF objects
+
+    __getstate__, __setstate__ = lib.generate_pickle_methods(
+        excludes=('_rsh_df',))
 
     @property
     def grids(self):
@@ -233,10 +246,33 @@ class FFTDF(lib.StreamObject):
     def grids(self, val):
         self.mesh = val.mesh
 
+    @property
+    def kpts(self):
+        if isinstance(self._kpts, KPoints):
+            return self._kpts
+        else:
+            return self.cell.get_abs_kpts(cp.asnumpy(self._kpts))
+
+    @kpts.setter
+    def kpts(self, val):
+        if val is None:
+            self._kpts = np.zeros((1, 3))
+        elif isinstance(val, KPoints):
+            self._kpts = val
+        else:
+            self._kpts = self.cell.get_scaled_kpts(val)
+
+    def reset(self, cell=None):
+        if cell is not None:
+            if isinstance(self._kpts, KPoints):
+                self.kpts = reset_kpts(self.kpts, cell)
+            self.cell = cell
+        self._rsh_df = {}
+        return self
+
     dump_flags = fft_cpu.FFTDF.dump_flags
     check_sanity = fft_cpu.FFTDF.check_sanity
     build = fft_cpu.FFTDF.build
-    reset = fft_cpu.FFTDF.reset
 
     get_pp = get_pp
     get_nuc = get_nuc
@@ -248,7 +284,7 @@ class FFTDF(lib.StreamObject):
                 return rsh_df.get_jk(dm, hermi, kpts, kpts_band, with_j, with_k,
                                      omega=None, exxdiv=exxdiv)
 
-        kpts, is_single_kpt = _check_kpts(self, kpts)
+        kpts, is_single_kpt = _check_kpts(kpts, dm)
         if is_single_kpt:
             vj, vk = fft_jk.get_jk(self, dm, hermi, kpts[0], kpts_band,
                                    with_j, with_k, exxdiv)
@@ -261,6 +297,8 @@ class FFTDF(lib.StreamObject):
         return vj, vk
 
     get_j_e1 = fft_jk.get_j_e1_kpts
+    get_k_e1 = NotImplemented
+    get_jk_e1 = NotImplemented
 
     get_eri = get_ao_eri = NotImplemented
     ao2mo = get_mo_eri = NotImplemented
@@ -273,9 +311,9 @@ class FFTDF(lib.StreamObject):
     to_gpu = utils.to_gpu
     device = utils.device
 
+    # customize to_cpu because attributes grids and kpts are not compatible with pyscf-2.10
     def to_cpu(self):
         from pyscf.pbc.df.fft import FFTDF
-        out = FFTDF(self.cell)
+        out = FFTDF(self.cell, kpts=self.kpts)
         out.mesh = self.mesh
-        out.kpts = self.kpts
         return out

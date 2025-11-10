@@ -7,11 +7,16 @@ set(pbc_gpu_sources_base
   ft_ao
   unrolled_ft_ao
   ft_ao_bdiv
+  ft_ao_ip1
   fill_int3c2e
   unrolled_int3c2e
   fill_int2c2e
+  fill_int3c2e_v2
+  overlap
   estimator
   rys_roots_dat
+  rys_contract_k
+  rys_contract_jk_ip1
   nr_eval_gto
 )
 

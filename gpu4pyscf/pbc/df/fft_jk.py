@@ -276,6 +276,7 @@ def get_j(mydf, dm, hermi=1, kpt=np.zeros(3), kpts_band=None):
     nao = dm.shape[-1]
     dm_kpts = dm.reshape(-1,1,nao,nao)
     vj = get_j_kpts(mydf, dm_kpts, hermi, kpt.reshape(1,3), kpts_band)
+    assert vj.ndim == 4
     if kpts_band is None:
         vj = vj[:,0,:,:]
     if dm.ndim == 2:
@@ -310,6 +311,7 @@ def get_k(mydf, dm, hermi=1, kpt=np.zeros(3), kpts_band=None, exxdiv=None):
     nao = dm.shape[-1]
     dm_kpts = dm.reshape(-1,1,nao,nao)
     vk = get_k_kpts(mydf, dm_kpts, hermi, kpt.reshape(1,3), kpts_band, exxdiv)
+    assert vk.ndim == 4
     if kpts_band is None:
         vk = vk[:,0,:,:]
     if dm.ndim == 2:
@@ -370,7 +372,8 @@ def get_k_e1_kpts(mydf, dm_kpts, kpts=np.zeros((1,3)), exxdiv=None):
 
 def _ewald_exxdiv_for_G0(cell, kpts, dms, vk, kpts_band=None):
     from pyscf.pbc.tools.pbc import madelung
-    s = cp.asarray(cell.pbc_intor('int1e_ovlp', hermi=1, kpts=kpts))
+    from gpu4pyscf.pbc.gto.int1e import int1e_ovlp
+    s = int1e_ovlp(cell, kpts=kpts)
     m = madelung(cell, kpts)
     if kpts is None:
         for i,dm in enumerate(dms):
@@ -417,8 +420,10 @@ def _format_jks(v_kpts, dm_kpts, kpts_band, kpts):
             if dm_kpts.ndim < 3: # RHF dm
                 v_kpts = v_kpts[0]
         else:
-            if kpts is None or kpts.ndim == 1:
+            if kpts is None or kpts.ndim == 1 or (kpts.ndim == 2 and kpts.shape[0] == 1):
                 nkpts = 1
+                if dm_kpts.ndim == 2:
+                    dm_kpts = dm_kpts[None,:,:]
             else:
                 nkpts = len(kpts)
             assert kpts.ndim == 2

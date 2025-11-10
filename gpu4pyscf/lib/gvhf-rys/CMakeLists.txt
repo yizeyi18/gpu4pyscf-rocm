@@ -3,20 +3,25 @@ if(GPU4PYSCF_USE_CUDA)
 endif()
 
 set(gvhf_rys_gpu_sources_base
-  rys_contract_jk
   rys_jk_driver
   rys_roots_dat
   unrolled_os
   unrolled_rys
-  rys_contract_j
-  unrolled_rys_j
+  #rys_contract_j
+  #unrolled_rys_j
   count_tasks
+  rys_constant
+  rys_contract_k
+  unrolled_rys_k
+  rys_contract_jk
+  unrolled_rys_jk
   rys_contract_jk_ip1
-  unrolled_rys_ip1
+  unrolled_rys_jk_ip1
   unrolled_ejk_ip1
   rys_contract_jk_ip2
   unrolled_ejk_ip2_type12
   unrolled_ejk_ip2_type3
+  contract_int3c2e
 )
 
 set(gvhf_rys_gpu_sources "")
@@ -30,7 +35,7 @@ endif()
 
 set(gvhf_rys_cpu_sources
   nr_sr_estimator.c
-  cart2xyz.c
+  #cart2xyz.c
 )
 
 add_library(gvhf_rys SHARED

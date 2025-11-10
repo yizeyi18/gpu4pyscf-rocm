@@ -29,6 +29,7 @@ from gpu4pyscf.lib.cupy_helper import pack_tril, unpack_tril
 from gpu4pyscf.lib.diis import DIIS
 from gpu4pyscf.lib import logger
 import time
+import warnings
 
 # np.set_printoptions(linewidth = np.iinfo(np.int32).max, threshold = np.iinfo(np.int32).max, precision = 16, suppress = True)
 
@@ -38,6 +39,7 @@ def merge_mol(mol_list):
     merged = mol_list[0]
     for i in range(1, n_frag):
         merged = conc_mol(merged, mol_list[i])
+    merged.stdout = mol_list[0].stdout # Same change as https://github.com/pyscf/pyscf/pull/2900
     return merged
 
 def _get_total_system_Fock_and_energy(mf_sum, dm, H1e):
@@ -128,7 +130,7 @@ def get_eda_classical_electrostatic_energy(mf_list, _make_mf, eda_cache):
             dm_j_resized = cp.zeros([nao_i + nao_j, nao_i + nao_j])
             dm_j_resized[nao_i : nao_i+nao_j, nao_i : nao_i+nao_j] = dm_j
 
-            mol_merged = conc_mol(mf_i.mol, mf_j.mol)
+            mol_merged = merge_mol([mf_i.mol, mf_j.mol])
             mf_merged = _make_mf(mol_merged, if_kernel = False)
             J_j = mf_merged.get_j(mol_merged, dm_i_resized)
             E_ee_ij = contract('ij,ij->', dm_j_resized, J_j)
@@ -269,7 +271,7 @@ def get_eda_electrostatic_energy(mf_list, _make_mf, eda_cache, build_orbital_hes
                     orbital_gradient_ij.reshape(nocc_count[i_frag] * nocc_count[j_frag])
                 orbital_gradient_ij = None
 
-        if build_orbital_hessian:
+        if nocc_frag_pair_sum < 2 or build_orbital_hessian:
             orbital_hessian = cp.zeros([nocc_frag_pair_sum, nocc_frag_pair_sum])
             for i_frag in range(n_frag):
                 mocc_i = mocc_sum[:, nocc_offsets[i_frag] : nocc_offsets[i_frag + 1]]
@@ -1080,6 +1082,7 @@ def eval_ALMO_EDA_2_energies(mol_list, if_compute_gradient = False,
         mf.direct_scf_tol = 1e-16
         if if_kernel:
             energy = mf.kernel()
+            mf.mol.stdout.flush()
             assert mf.converged
             return mf, energy
         else:
@@ -1092,9 +1095,17 @@ def eval_ALMO_EDA_2_energies(mol_list, if_compute_gradient = False,
         gradient = grad_obj.kernel()
         if isinstance(gradient, cp.ndarray):
             gradient = gradient.get()
+        mf.mol.stdout.flush()
         return grad_obj.kernel()
 
     n_frag = len(mol_list)
+    for i_frag in range(n_frag):
+        for j_frag in range(i_frag + 1, n_frag):
+            if mol_list[i_frag].stdout != mol_list[j_frag].stdout:
+                warnings.warn("The stdout of each mol in mol_list is not consistent. We do not guarantee which stdout to write. "
+                              "Notice if the mol objects share the same \"output\" value, then the same output file is opened "
+                              "more than once, and the outputs of earlier-created mol will be lost.")
+
     mf_list = []
     frag_energy_list = []
     frag_gradient_list = []

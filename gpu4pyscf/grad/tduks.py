@@ -31,7 +31,8 @@ from gpu4pyscf import tdscf
 #
 # Given Y = 0, TDHF gradients (XAX+XBY+YBX+YAY)^1 turn to TDA gradients (XAX)^1
 #
-def grad_elec(td_grad, x_y, singlet=True, atmlst=None, verbose=logger.INFO):
+def grad_elec(td_grad, x_y, singlet=True, atmlst=None, verbose=logger.INFO,
+              with_solvent=False):
     """
     Electronic part of TDA, TDDFT nuclear gradients
 
@@ -41,6 +42,11 @@ def grad_elec(td_grad, x_y, singlet=True, atmlst=None, verbose=logger.INFO):
         x_y : a two-element list of numpy arrays
             TDDFT X and Y amplitudes. If Y is set to 0, this function computes
             TDA energy gradients.
+
+    Kwargs:
+        with_solvent :
+            Include the response of solvent in the gradients of the electronic
+            energy.
     """
     if singlet is not True and singlet is not None:
         raise NotImplementedError("Only for spin-conserving TDDFT")
@@ -91,7 +97,9 @@ def grad_elec(td_grad, x_y, singlet=True, atmlst=None, verbose=logger.INFO):
     dmzoob = reduce(cp.dot, (orbob, doob, orbob.T))
     dmzooa += reduce(cp.dot, (orbva, dvva, orbva.T))
     dmzoob += reduce(cp.dot, (orbvb, dvvb, orbvb.T))
-    td_grad.dmxpy = (dmxpya + dmxpyb)*0.5
+    dmxpy = (dmxpya + dmxpyb)*0.5
+    if with_solvent:
+        td_grad._dmxpy = dmxpy
 
     ni = mf._numint
     ni.libxc.test_deriv_order(mf.xc, 3, raise_error=True)
@@ -137,11 +145,13 @@ def grad_elec(td_grad, x_y, singlet=True, atmlst=None, verbose=logger.INFO):
         vk = vk.reshape(2, 3, nao, nao)
 
         veff0doo = vj[0, 0] + vj[1, 0] - vk[:, 0] + f1oo[:, 0] + k1ao[:, 0] * 2
-        veff0doo += td_grad.solvent_response((dmzooa + dmzoob)*0.5)
+        if with_solvent:
+            veff0doo += td_grad.solvent_response((dmzooa + dmzoob)*0.5)
         wvoa = reduce(cp.dot, (orbva.T, veff0doo[0], orboa)) * 2
         wvob = reduce(cp.dot, (orbvb.T, veff0doo[1], orbob)) * 2
         veff = vj[0, 1] + vj[1, 1] - vk[:, 1] + f1vo[:, 0] * 2
-        veff += td_grad.solvent_response((td_grad.dmxpy + td_grad.dmxpy.T))
+        if with_solvent:
+            veff += td_grad.solvent_response((dmxpy + dmxpy.T))
         veff0mopa = reduce(cp.dot, (mo_coeff[0].T, veff[0], mo_coeff[0]))
         veff0mopb = reduce(cp.dot, (mo_coeff[1].T, veff[1], mo_coeff[1]))
         wvoa -= contract("ki,ai->ak", veff0mopa[:nocca, :nocca], xpya) * 2
@@ -245,7 +255,8 @@ def grad_elec(td_grad, x_y, singlet=True, atmlst=None, verbose=logger.INFO):
 
     dmz1dooa = z1ao[0] + dmzooa
     dmz1doob = z1ao[1] + dmzoob
-    td_grad.dmz1doo = (dmz1dooa + dmz1doob)*0.5
+    if with_solvent:
+        td_grad._dmz1doo = (dmz1dooa + dmz1doob)*0.5
     oo0a = reduce(cp.dot, (orboa, orboa.T))
     oo0b = reduce(cp.dot, (orbob, orbob.T))
 
@@ -280,23 +291,23 @@ def grad_elec(td_grad, x_y, singlet=True, atmlst=None, verbose=logger.INFO):
     dvhf = td_grad.get_veff(mol, cp.stack(((dmz1dooa + dmz1dooa.T) * 0.25 + oo0a,
                                            (dmz1doob + dmz1doob.T) * 0.25 + oo0b,)), j_factor, k_factor)
     for k, ia in enumerate(atmlst):
-        extra_force[k] += mf_grad.extra_force(ia, locals())
+        extra_force[k] += cp.asarray(mf_grad.extra_force(ia, locals()))
     dvhf_all += dvhf
     # this term will remove the unused-part from PP density.
     dvhf = td_grad.get_veff(mol, cp.stack(((dmz1dooa + dmz1dooa.T), (dmz1doob + dmz1doob.T))) * 0.25,
         j_factor, k_factor)
     for k, ia in enumerate(atmlst):
-        extra_force[k] -= mf_grad.extra_force(ia, locals())
+        extra_force[k] -= cp.asarray(mf_grad.extra_force(ia, locals()))
     dvhf_all -= dvhf
     dvhf = td_grad.get_veff(mol, cp.stack(((dmxpya + dmxpya.T), (dmxpyb + dmxpyb.T))) * 0.5,
             j_factor, k_factor)
     for k, ia in enumerate(atmlst):
-        extra_force[k] += mf_grad.extra_force(ia, locals()) * 2
+        extra_force[k] += cp.asarray(mf_grad.extra_force(ia, locals()) * 2)
     dvhf_all += dvhf * 2
     dvhf = td_grad.get_veff(mol, cp.stack(((dmxmya - dmxmya.T), (dmxmyb - dmxmyb.T))) * 0.5,
             j_factor=0.0, k_factor=k_factor, hermi=2)
     for k, ia in enumerate(atmlst):
-        extra_force[k] += mf_grad.extra_force(ia, locals()) * 2
+        extra_force[k] += cp.asarray(mf_grad.extra_force(ia, locals()) * 2)
     dvhf_all += dvhf * 2
 
     if with_k and omega != 0:
@@ -308,25 +319,25 @@ def grad_elec(td_grad, x_y, singlet=True, atmlst=None, verbose=logger.INFO):
                            (dmz1doob + dmz1doob.T) * 0.25 + oo0b)),
             j_factor=0.0, k_factor = k_factor, omega=omega)
         for k, ia in enumerate(atmlst):
-            extra_force[k] += mf_grad.extra_force(ia, locals())
+            extra_force[k] += cp.asarray(mf_grad.extra_force(ia, locals()))
         dvhf_all += dvhf
         dvhf = td_grad.get_veff(mol,
                 cp.stack(((dmz1dooa + dmz1dooa.T) * 0.25, (dmz1doob + dmz1doob.T) * 0.25)),
                 j_factor=0.0, k_factor = k_factor, omega=omega)
         for k, ia in enumerate(atmlst):
-            extra_force[k] -= mf_grad.extra_force(ia, locals())
+            extra_force[k] -= cp.asarray(mf_grad.extra_force(ia, locals()))
         dvhf_all -= dvhf
         dvhf = td_grad.get_veff(mol,
                 cp.stack(((dmxpya + dmxpya.T) * 0.5, (dmxpyb + dmxpyb.T) * 0.5)),
                 j_factor=0.0, k_factor = k_factor, omega=omega)
         for k, ia in enumerate(atmlst):
-            extra_force[k] += mf_grad.extra_force(ia, locals()) * 2
+            extra_force[k] += cp.asarray(mf_grad.extra_force(ia, locals()) * 2)
         dvhf_all += dvhf * 2
         dvhf = td_grad.get_veff(mol,
                 cp.stack(((dmxmya - dmxmya.T) * 0.5, (dmxmyb - dmxmyb.T) * 0.5)),
                 j_factor=0.0, k_factor = k_factor, omega=omega, hermi=2)
         for k, ia in enumerate(atmlst):
-            extra_force[k] += mf_grad.extra_force(ia, locals()) * 2
+            extra_force[k] += cp.asarray(mf_grad.extra_force(ia, locals()) * 2)
         dvhf_all += dvhf * 2
     time1 = log.timer('2e AO integral derivatives', *time1)
 
@@ -505,11 +516,7 @@ def _contract_xc_kernel(td_grad, xc_code, dmvo, dmoo=None, with_vxc=True, with_k
 
 
 class Gradients(tdrhf.Gradients):
-    @lib.with_doc(grad_elec.__doc__)
-    def grad_elec(self, xy, singlet=None, atmlst=None, verbose=logger.info):
-        return grad_elec(self, xy, singlet, atmlst, self.verbose)
+    grad_elec = grad_elec
 
 
 Grad = Gradients
-
-tdscf.uks.TDA.Gradients = tdscf.uks.TDDFT.Gradients = lib.class_as_method(Gradients)

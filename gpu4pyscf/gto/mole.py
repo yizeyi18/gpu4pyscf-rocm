@@ -1,4 +1,4 @@
-# Copyright 2021-2024 The PySCF Developers. All Rights Reserved.
+# Copyright 2021-2025 The PySCF Developers. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -43,7 +43,7 @@ def basis_seg_contraction(mol, allow_replica=1, sparse_coeff=False):
             By default, high angular momentum functions (d, f shells) are fully
             uncontracted.
     '''
-    from gpu4pyscf.lib.cupy_helper import block_diag
+    from gpu4pyscf.lib.cupy_helper import block_diag, asarray
     # Ensure backward compatibility. When allow_replica is True, decontraction
     # to primitive functions is disabled. When allow_replica is False, all
     # general contraction are decontracted.
@@ -56,6 +56,12 @@ def basis_seg_contraction(mol, allow_replica=1, sparse_coeff=False):
     workspace = cp.empty(30**2*100)
     workspace = None # noqa: F841
     bas_templates = {}
+    lmax = mol._bas[:,ANG_OF].max()
+    if mol.cart:
+        c2s = [np.eye((l+1)*(l+2)//2) for l in range(lmax+1)]
+    else:
+        c2s = [gto.mole.cart2sph(l, normalized='sp') for l in range(lmax+1)]
+    c2s_gpu = [asarray(c, order='C') for c in c2s]
     _bas = []
     _env = mol._env.copy()
     contr_coeff = []
@@ -76,13 +82,13 @@ def basis_seg_contraction(mol, allow_replica=1, sparse_coeff=False):
                 nctr = shell[NCTR_OF]
                 if nctr == 1:
                     bas_of_ia.append(shell)
-                    coeff.append(cp.eye(nf))
+                    coeff.append(c2s_gpu[l])
                     continue
                 # Only basis with nctr > 1 needs to be decontracted
                 nprim = shell[NPRIM_OF]
                 pcoeff = shell[PTR_COEFF]
                 if l <= allow_replica:
-                    coeff.extend([cp.eye(nf)] * nctr)
+                    coeff.extend([c2s_gpu[l]] * nctr)
                     bs = np.repeat(shell[np.newaxis], nctr, axis=0)
                     bs[:,NCTR_OF] = 1
                     bs[:,PTR_COEFF] = np.arange(pcoeff, pcoeff+nprim*nctr, nprim)
@@ -93,8 +99,8 @@ def basis_seg_contraction(mol, allow_replica=1, sparse_coeff=False):
                     norm = gto.gto_norm(l, exps)
                     # remove normalization from contraction coefficients
                     c = _env[pcoeff:pcoeff+nprim*nctr].reshape(nctr,nprim)
-                    c = np.einsum('ip,p,ef->iepf', c, 1/norm, np.eye(nf))
-                    coeff.append(cp.asarray(c.reshape(nf*nctr, nf*nprim).T, order='C'))
+                    c = np.einsum('ip,p,fe->pfie', c, 1/norm, c2s[l])
+                    coeff.append(asarray(c.reshape(nf*nprim,-1), order='C'))
 
                     _env[pcoeff:pcoeff+nprim] = norm
                     bs = np.repeat(shell[np.newaxis], nprim, axis=0)
@@ -121,10 +127,6 @@ def basis_seg_contraction(mol, allow_replica=1, sparse_coeff=False):
 
     if not sparse_coeff:
         contr_coeff = block_diag(contr_coeff)
-
-        if not mol.cart:
-            c2s = block_diag([cart2sph_by_l(l) for l in pmol._bas[:,ANG_OF]])
-            contr_coeff = contr_coeff.dot(c2s)
         return pmol, contr_coeff
     else:
         return pmol, None
@@ -173,16 +175,41 @@ def sort_atoms(mol):
 
     return [x for heavy_list in full_path for x in heavy_list]
 
-def group_basis(mol, tile=1, group_size=None, return_bas_mapping=False, sparse_coeff=False):
-    '''Group basis functions according to their [l, nprim] patterns.
+def group_basis(mol, tile=1, group_size=None, return_bas_mapping=False,
+                sparse_coeff=False):
+    '''Group and sort basis functions according to their [l, nprim] patterns.
 
-    bas_mapping is the index that transforms _bas from sorted_mol to mol:
-    mol._bas = sorted_mol._bas[bas_mapping]
+    Kwargs:
+        tile (int):
+            Align the number of basis shells in each group to a multiple of tile.
+            Basis functions with zero contraction coefficients may be padded to
+            preserve alignment. Default is 1.
+        group_size (int):
+            Maximum number of basis shells within each group. Be default, no
+            limit is applied.
+        return_bas_mapping (bool):
+            bas_mapping is an index array that can transform _bas from
+            sorted_mol to mol: mol._bas = sorted_mol._bas[bas_mapping]
+        sparse_coeff (bool):
+            One-to-one mapping between the sorted_mol and mol is assumed.
+            The array of mapping indices instead of a single transformation
+            matrix is returned if this option is specified.
     '''
     from gpu4pyscf.lib import logger
     original_mol = mol
 
-    mol, coeff = basis_seg_contraction(mol, sparse_coeff = sparse_coeff)
+    # When sparse_coeff is enabled, an array of AO mapping indices will be
+    # returned which can facilitate the transformation of the integral matrix
+    # between sorted_mol and mol using fancy-indexing, without applying the
+    # expensive C.T.dot(mat).dot(C). This fast transformation assumes one-one
+    # mapping between the basis shells of the two types of mol instatnce,
+    # ignoring general contraction. Enabling `allow_replica` will produce
+    # replicated segment-contracted shells for general contracted shells.
+    if sparse_coeff:
+        mol, coeff = basis_seg_contraction(
+            mol, allow_replica=True, sparse_coeff=sparse_coeff)
+    else:
+        mol, coeff = basis_seg_contraction(mol, sparse_coeff=sparse_coeff)
 
     # Sort basis according to angular momentum and contraction patterns so
     # as to group the basis functions to blocks in GPU kernel.
@@ -266,8 +293,6 @@ def group_basis(mol, tile=1, group_size=None, return_bas_mapping=False, sparse_c
         else:
             return mol, coeff, uniq_l_ctr, l_ctr_counts
     else:
-        n_cartesian = sum([(l+1)*(l+2)//2 for l in mol._bas[:,ANG_OF]])
-        assert n_cartesian < 32768
         l_ctr_offsets = np.cumsum(l_ctr_counts)[:-1]
         if_pad_bas_per_l_ctr = np.split(if_pad_bas, l_ctr_offsets)
         l_ctr_pad_counts = np.array([np.sum(if_pad) for if_pad in if_pad_bas_per_l_ctr])
@@ -280,8 +305,6 @@ def _split_l_ctr_groups(uniq_l_ctr, l_ctr_counts, group_size, align=1):
     '''Splits l_ctr patterns into small groups with group_size the maximum
     number of AOs in each group
     '''
-    l = uniq_l_ctr[:,0]
-    nf = l * (l + 1) // 2
     _l_ctrs = []
     _l_ctr_counts = []
     for l_ctr, counts in zip(uniq_l_ctr, l_ctr_counts):
@@ -304,13 +327,14 @@ def _split_l_ctr_groups(uniq_l_ctr, l_ctr_counts, group_size, align=1):
     l_ctr_counts = np.hstack(_l_ctr_counts)
     return uniq_l_ctr, l_ctr_counts
 
-def extract_pgto_params(mol, op='diffused'):
+def extract_pgto_params(mol, op='diffuse'):
     '''A helper function to extract exponents and contraction coefficients of
-    the most diffused or compact primitive GTOs for each shell. These exponents
+    the most diffuse or compact primitive GTOs for each shell. These exponents
     and coefficients are typically used in estimating rcut and Ecut for PBC
     methods.
     '''
-    if op != 'diffused' and op != 'compact':
+    op = op[:7]
+    if op != 'diffuse' and op != 'compact':
         raise RuntimeError(f'Unsupported operation {op}')
 
     e = np.hstack(mol.bas_exps())
@@ -319,20 +343,34 @@ def extract_pgto_params(mol, op='diffused'):
     l = np.repeat(mol._bas[:,ANG_OF], mol._bas[:,NPRIM_OF])
     basis_id = np.repeat(np.arange(mol.nbas), mol._bas[:,NPRIM_OF])
     precision = 1e-8
-    if op == 'diffused':
+    if op == 'diffuse':
         # A quick estimation for the radius that each primitive GTO decays to the
         # value smaller than the required precision
         r2 = np.log(c**2/precision * 10**l + 1e-200) / e
-        # groupby.argmin()
-        r2_order = np.argsort(-r2)
-        _, idx = np.unique(basis_id[r2_order], return_index=True)
-        idx = r2_order[idx]
+        idx = groupby(basis_id, r2, 'argmax')
     else:
         # A quick estimation for the resolution of planewaves that each
         # primitive GTO requires
         ke = np.log(c**2 / precision * 50**l + 1e-200) * e
-        # groupby.argmax()
-        ke_order = np.argsort(-ke)
-        _, idx = np.unique(basis_id[ke_order], return_index=True)
-        idx = ke_order[idx]
+        idx = groupby(basis_id, ke, 'argmax')
     return e[idx], c[idx]
+
+def groupby(labels, a, op='argmin'):
+    '''Perform groupby(labels, a).op(). For example,
+    groupby(['A', 'A', 'B'], [1, 2, 3], 'min') => [1, 3]
+    '''
+    if 'min' in op:
+        a_order = a.argsort()
+        _, idx = np.unique(labels[a_order], return_index=True)
+        idx = a_order[idx]
+    elif 'max' in op:
+        a_order = a.argsort()[::-1]
+        _, idx = np.unique(labels[a_order], return_index=True)
+        idx = a_order[idx]
+    else:
+        raise NotImplementedError
+
+    if 'arg' in op:
+        return idx
+    else:
+        return a[idx]

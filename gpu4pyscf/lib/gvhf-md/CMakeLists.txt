@@ -8,6 +8,8 @@ set(gvhf_md_gpu_sources_base
   unrolled_md_j_4dm
   md_indices
   md_j_driver
+  contract_int3c2e
+  pbc_md_contract_j
 )
 
 set(gvhf_md_gpu_sources "")

@@ -27,7 +27,7 @@ __all__ = [
 ]
 
 class TDA(tdhf_gpu.TDA):
-    def nuc_grad_method(self):
+    def Gradients(self):
         if getattr(self._scf, 'with_df', None):
             from gpu4pyscf.df.grad import tdrks
             return tdrks.Gradients(self)
@@ -35,28 +35,18 @@ class TDA(tdhf_gpu.TDA):
             from gpu4pyscf.grad import tdrks
             return tdrks.Gradients(self)
     
-    def NAC(self):
+    def nac_method(self):
         if getattr(self._scf, 'with_df', None):
-            raise NotImplementedError("density fitting NAC is not supported.")
+            from gpu4pyscf.df.nac import tdrks
+            return tdrks.NAC(self)
         else:
             from gpu4pyscf.nac import tdrks
             return tdrks.NAC(self)
 
 class TDDFT(tdhf_gpu.TDHF):
-    def nuc_grad_method(self):
-        if getattr(self._scf, 'with_df', None):
-            from gpu4pyscf.df.grad import tdrks
-            return tdrks.Gradients(self)
-        else:
-            from gpu4pyscf.grad import tdrks
-            return tdrks.Gradients(self)
+    Gradients = TDA.Gradients
+    nac_method = TDA.nac_method
 
-    def NAC(self):
-        if getattr(self._scf, 'with_df', None):
-            raise NotImplementedError("density fitting NAC is not supported.")
-        else:
-            from gpu4pyscf.nac import tdrks
-            return tdrks.NAC(self)
 TDRKS = TDDFT
 
 class CasidaTDDFT(TDDFT):

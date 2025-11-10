@@ -16,22 +16,20 @@
 from functools import reduce
 import cupy as cp
 import numpy as np
-from pyscf import lib
+from pyscf import lib, gto
 from gpu4pyscf.lib import logger
-from gpu4pyscf.lib.cupy_helper import contract, add_sparse, tag_array
+from gpu4pyscf.lib.cupy_helper import contract, tag_array
 from gpu4pyscf.df import int3c2e
 from gpu4pyscf.df.grad import tdrhf as tdrhf_df
-from gpu4pyscf.dft import numint,rks
-from pyscf.dft.numint import NumInt as numint_cpu
+from gpu4pyscf.dft import rks
 from gpu4pyscf.scf import cphf
 from gpu4pyscf.grad import rhf as rhf_grad
-from gpu4pyscf.grad import rks as rks_grad
 from gpu4pyscf.grad import tdrhf
 from gpu4pyscf.grad import tdrks
 from gpu4pyscf import tdscf
 from gpu4pyscf.tdscf.ris import get_auxmol
 
-def grad_elec(td_grad, x_y, theta=None, J_fit=None, K_fit=None, singlet=True, atmlst=None, verbose=logger.INFO):
+def grad_elec(td_grad, x_y, singlet=True, atmlst=None, verbose=logger.INFO):
     """
     Electronic part of TDA, TDDFT nuclear gradients
 
@@ -42,11 +40,11 @@ def grad_elec(td_grad, x_y, theta=None, J_fit=None, K_fit=None, singlet=True, at
             TDDFT X and Y amplitudes. If Y is set to 0, this function computes
             TDA energy gradients.
     """
-    
-    if J_fit is None:
-        J_fit = td_grad.base.J_fit
-    if K_fit is None:
-        K_fit = td_grad.base.K_fit
+    if td_grad.base.Ktrunc != 0.0:
+        raise NotImplementedError('Ktrunc or frozen method is not supported yet')
+    J_fit = td_grad.base.J_fit
+    K_fit = td_grad.base.K_fit
+    theta = td_grad.base.theta
     if singlet is None:
         singlet = True
     log = logger.new_logger(td_grad, verbose)
@@ -71,8 +69,6 @@ def grad_elec(td_grad, x_y, theta=None, J_fit=None, K_fit=None, singlet=True, at
     orbo = mo_coeff[:, :nocc]
     if getattr(mf, 'with_solvent', None) is not None:
         raise NotImplementedError('With solvent is not supported yet')
-    if getattr(mf, 'with_df', None) is not None:
-        raise NotImplementedError('With density fitting is not supported yet')
     
     dvv = contract("ai,bi->ab", xpy, xpy) + contract("ai,bi->ab", xmy, xmy)  # 2 T_{ab}
     doo = -contract("ai,aj->ij", xpy, xpy) - contract("ai,aj->ij", xmy, xmy)  # 2 T_{ij}
@@ -97,7 +93,7 @@ def grad_elec(td_grad, x_y, theta=None, J_fit=None, K_fit=None, singlet=True, at
     mf_K = rks.RKS(mol).density_fit()
     mf_K.with_df.auxmol = auxmol_K
     
-    f1vo, f1oo, vxc1, k1ao = tdrks._contract_xc_kernel(td_grad, mf.xc, dmxpy, dmzoo, True, True, singlet)
+    f1oo, _, vxc1, _ = tdrks._contract_xc_kernel(td_grad, mf.xc, dmzoo, None, True, False, singlet)
     with_k = ni.libxc.is_hybrid_xc(mf.xc)
     if with_k:
         vj0, vk0 = mf.get_jk(mol, dmzoo, hermi=0)
@@ -238,12 +234,12 @@ def grad_elec(td_grad, x_y, theta=None, J_fit=None, K_fit=None, singlet=True, at
     # this term contributes the ground state contribution.
     dvhf = td_grad.get_veff(mol, (dmz1doo + dmz1doo.T) * 0.5 + oo0 * 2, j_factor=j_factor, k_factor=k_factor)
     for k, ia in enumerate(atmlst):
-        extra_force[k] += mf_grad.extra_force(ia, locals())
+        extra_force[k] += cp.asarray(mf_grad.extra_force(ia, locals()))
     dvhf_all += dvhf
     # this term will remove the unused-part from PP density.
     dvhf = td_grad.get_veff(mol, (dmz1doo + dmz1doo.T) * 0.5, j_factor=j_factor, k_factor=k_factor)
     for k, ia in enumerate(atmlst):
-        extra_force[k] -= mf_grad.extra_force(ia, locals())
+        extra_force[k] -= cp.asarray(mf_grad.extra_force(ia, locals()))
     dvhf_all -= dvhf
     if singlet:
         j_factor=1.0
@@ -251,11 +247,11 @@ def grad_elec(td_grad, x_y, theta=None, J_fit=None, K_fit=None, singlet=True, at
         j_factor=0.0
     dvhf = get_veff_ris(mf_J, mf_K, mol, dmxpy + dmxpy.T, j_factor=j_factor, k_factor=k_factor)
     for k, ia in enumerate(atmlst):
-        extra_force[k] += get_extra_force(ia, locals()) * 2
+        extra_force[k] += cp.asarray(get_extra_force(ia, locals()) * 2)
     dvhf_all += dvhf * 2
     dvhf = get_veff_ris(mf_J, mf_K, mol, dmxmy - dmxmy.T, j_factor=0.0, k_factor=k_factor, hermi=2)
     for k, ia in enumerate(atmlst):
-        extra_force[k] += get_extra_force(ia, locals()) * 2
+        extra_force[k] += cp.asarray(get_extra_force(ia, locals()) * 2)
     dvhf_all += dvhf * 2
 
     if with_k and omega != 0:
@@ -265,22 +261,22 @@ def grad_elec(td_grad, x_y, theta=None, J_fit=None, K_fit=None, singlet=True, at
         dvhf = td_grad.get_veff(mol, (dmz1doo + dmz1doo.T) * 0.5 + oo0 * 2, 
                                 j_factor=j_factor, k_factor=k_factor, omega=omega)
         for k, ia in enumerate(atmlst):
-            extra_force[k] += mf_grad.extra_force(ia, locals())
+            extra_force[k] += cp.asarray(mf_grad.extra_force(ia, locals()))
         dvhf_all += dvhf
         dvhf = td_grad.get_veff(mol, (dmz1doo + dmz1doo.T) * 0.5, 
                                 j_factor=j_factor, k_factor=k_factor, omega=omega)
         for k, ia in enumerate(atmlst):
-            extra_force[k] -= mf_grad.extra_force(ia, locals())
+            extra_force[k] -= cp.asarray(mf_grad.extra_force(ia, locals()))
         dvhf_all -= dvhf
         dvhf = get_veff_ris(mf_J, mf_K, mol, dmxpy + dmxpy.T, 
                                 j_factor=j_factor, k_factor=k_factor, omega=omega)
         for k, ia in enumerate(atmlst):
-            extra_force[k] += get_extra_force(ia, locals()) * 2
+            extra_force[k] += cp.asarray(get_extra_force(ia, locals()) * 2)
         dvhf_all += dvhf * 2
         dvhf = get_veff_ris(mf_J, mf_K, mol, dmxmy - dmxmy.T, 
                                 j_factor=j_factor, k_factor=k_factor, omega=omega, hermi=2)
         for k, ia in enumerate(atmlst):
-            extra_force[k] += get_extra_force(ia, locals()) * 2
+            extra_force[k] += cp.asarray(get_extra_force(ia, locals()) * 2)
         dvhf_all += dvhf * 2
     time1 = log.timer('2e AO integral derivatives', *time1)
     fxcz1 = tdrks._contract_xc_kernel(td_grad, mf.xc, z1ao, None, False, False, True)[0]
@@ -305,14 +301,15 @@ def grad_elec(td_grad, x_y, theta=None, J_fit=None, K_fit=None, singlet=True, at
 def get_extra_force(atom_id, envs):
     return envs['dvhf'].aux[atom_id]
 
+
 def get_veff_ris(mf_J, mf_K, mol=None, dm=None, j_factor=1.0, k_factor=1.0, omega=0.0, hermi=0, verbose=None):
     
     if omega != 0.0:
-        vj, _, vjaux, _ = tdrhf_df.get_jk(mf_J, mol, dm, omega=omega, hermi=hermi)
-        _, vk, _, vkaux = tdrhf_df.get_jk(mf_K, mol, dm, omega=omega, hermi=hermi)
+        vj, _, vjaux, _ = tdrhf_df.get_jk(mf_J, mol, dm, omega=omega, hermi=hermi, with_k=False)
+        _, vk, _, vkaux = tdrhf_df.get_jk(mf_K, mol, dm, omega=omega, hermi=hermi, with_j=False)
     else:
-        vj, _, vjaux, _ = tdrhf_df.get_jk(mf_J, mol, dm, hermi=hermi)
-        _, vk, _, vkaux = tdrhf_df.get_jk(mf_K, mol, dm, hermi=hermi)
+        vj, _, vjaux, _ = tdrhf_df.get_jk(mf_J, mol, dm, hermi=hermi, with_k=False)
+        _, vk, _, vkaux = tdrhf_df.get_jk(mf_K, mol, dm, hermi=hermi, with_j=False)
     vhf = vj * j_factor - vk * .5 * k_factor
     e1_aux = vjaux * j_factor - vkaux * .5 * k_factor
     vhf = tag_array(vhf, aux=e1_aux)
@@ -326,6 +323,8 @@ class Gradients(tdrhf.Gradients):
             state : int
                 Excited state ID.  state = 1 means the first excited state.
         """
+        if self.base.Ktrunc != 0.0:
+            raise NotImplementedError('Ktrunc or frozen method is not supported yet')
         log = self.base.log
         warn_message = "TDDFT-ris gradient is still in the experimental stage, \n" +\
             "and its APIs are subject to change in future releases."
@@ -341,10 +340,10 @@ class Gradients(tdrhf.Gradients):
                     "state=0 found in the input. Gradients of ground state is computed.",
                 )
                 return self.base._scf.nuc_grad_method().kernel(atmlst=atmlst)
-            if self.base.xy is not None:
+            if self.base.xy[1] is not None:
                 xy = (self.base.xy[0][state-1]*np.sqrt(0.5), self.base.xy[1][state-1]*np.sqrt(0.5))
             else:
-                xy = (self.base.X[state-1]*np.sqrt(0.5), self.base.X[state-1]*0.0)
+                xy = (self.base.xy[0][state-1]*np.sqrt(0.5), self.base.xy[0][state-1]*0.0)
 
         if singlet is None:
             singlet = self.base.singlet
@@ -357,16 +356,15 @@ class Gradients(tdrhf.Gradients):
             self.check_sanity()
         if self.verbose >= logger.INFO:
             self.dump_flags()
-        theta = self.base.theta
-        de = self.grad_elec(xy, theta, singlet, atmlst, verbose=self.verbose)
+        de = self.grad_elec(xy, singlet, atmlst, verbose=self.verbose)
         self.de = de = de + self.grad_nuc(atmlst=atmlst)
         if self.mol.symmetry:
             self.de = self.symmetrize(self.de, atmlst)
         self._finalize()
         return self.de
     @lib.with_doc(grad_elec.__doc__)
-    def grad_elec(self, xy, theta, singlet, atmlst=None, verbose=logger.info):
-        return grad_elec(self, xy, theta, singlet=singlet, atmlst=atmlst, verbose=self.verbose)
+    def grad_elec(self, xy, singlet, atmlst=None, verbose=logger.info):
+        return grad_elec(self, xy, singlet=singlet, atmlst=atmlst, verbose=self.verbose)
 
 
 Grad = Gradients

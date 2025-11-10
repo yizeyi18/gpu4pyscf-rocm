@@ -19,7 +19,7 @@ This module is under development.
 from functools import reduce
 import cupy as cp
 import numpy as np
-from pyscf import lib
+from pyscf import lib, gto
 import pyscf
 from gpu4pyscf.lib import logger
 from pyscf.grad import rhf as rhf_grad_cpu
@@ -31,6 +31,46 @@ from pyscf import __config__
 from gpu4pyscf.lib import utils
 from gpu4pyscf import tdscf
 from pyscf.scf import _vhf
+from scipy.optimize import linear_sum_assignment
+
+
+def match_and_reorder_mos(s12_ao, mo_coeff_b, mo_coeff, threshold=0.4):
+    if mo_coeff_b.shape != mo_coeff.shape:
+        raise ValueError("Mo coeff b and mo coeff must have the same shape.")
+    if s12_ao.shape[0] != s12_ao.shape[1] or s12_ao.shape[0] != mo_coeff_b.shape[0]:
+        raise ValueError("S12 ao must be a square matrix with the same shape as mo coeff b.")
+    mo_overlap_matrix = mo_coeff_b.T @ s12_ao @ mo_coeff
+    abs_mo_overlap = cp.abs(mo_overlap_matrix)
+    cost_matrix = -abs_mo_overlap
+    below_threshold_mask = abs_mo_overlap < threshold
+    infinity_cost = mo_coeff_b.shape[1] + 1
+    cost_matrix[below_threshold_mask] = infinity_cost
+    
+    row_ind, col_ind = linear_sum_assignment(cost_matrix.get())
+
+    matching_indices = col_ind
+    
+    mo2_reordered = mo_coeff[:, matching_indices]
+
+    final_chosen_overlaps = abs_mo_overlap[row_ind, col_ind]
+    invalid_matches_mask = final_chosen_overlaps < threshold
+    
+    if cp.any(invalid_matches_mask):
+        num_invalid = cp.sum(invalid_matches_mask)
+        print(
+            f"{num_invalid} orbital below threshold {threshold}."
+            "This may indicate significant changes in the properties of these orbitals between the two structures."
+        )
+        invalid_indices = cp.where(invalid_matches_mask)[0]
+        for idx in invalid_indices:
+            print(f"Warning: reference coeff #{idx}'s best match is {final_chosen_overlaps[idx]:.4f} (below threshold {threshold})")
+    s_mo_new = mo_coeff_b.T @ s12_ao @ mo2_reordered
+    sign_array = cp.ones(s_mo_new.shape[-1])
+    for i in range(s_mo_new.shape[-1]):
+        if s_mo_new[i,i] < 0.0:
+            # mo2_reordered[:,i] *= -1
+            sign_array[i] = -1
+    return mo2_reordered, matching_indices, sign_array
 
 
 def get_nacv_ge(td_nac, x_yI, EI, singlet=True, atmlst=None, verbose=logger.INFO):
@@ -68,10 +108,6 @@ def get_nacv_ge(td_nac, x_yI, EI, singlet=True, atmlst=None, verbose=logger.INFO
     nvir = nmo - nocc
     orbv = mo_coeff[:, nocc:]
     orbo = mo_coeff[:, :nocc]
-    if getattr(mf, 'with_solvent', None) is not None:
-        raise NotImplementedError('With solvent is not supported yet')
-    if getattr(mf, 'with_df', None) is not None:
-        raise NotImplementedError('With density fitting is not supported yet')
 
     xI, yI = x_yI
     xI = cp.asarray(xI).reshape(nocc, nvir).T
@@ -80,7 +116,7 @@ def get_nacv_ge(td_nac, x_yI, EI, singlet=True, atmlst=None, verbose=logger.INFO
     yI = cp.asarray(yI).reshape(nocc, nvir).T
     LI = xI-yI    # eq.(83) in Ref. [1]
 
-    vresp = mf.gen_response(singlet=None, hermi=1)
+    vresp = td_nac.base.gen_response(singlet=None, hermi=1)
 
     def fvind(x):
         dm = reduce(cp.dot, (orbv, x.reshape(nvir, nocc) * 2, orbo.T)) # double occupency
@@ -114,6 +150,7 @@ def get_nacv_ge(td_nac, x_yI, EI, singlet=True, atmlst=None, verbose=logger.INFO
 
     mf_grad = mf.nuc_grad_method()
     dmz1doo = z1aoS
+    td_nac._dmz1doo = dmz1doo
     oo0 = reduce(cp.dot, (orbo, orbo.T)) * 2.0
 
     if atmlst is None:
@@ -201,10 +238,6 @@ def get_nacv_ee(td_nac, x_yI, x_yJ, EI, EJ, singlet=True, atmlst=None, verbose=l
     nvir = nmo - nocc
     orbv = mo_coeff[:, nocc:]
     orbo = mo_coeff[:, :nocc]
-    if getattr(mf, 'with_solvent', None) is not None:
-        raise NotImplementedError('With solvent is not supported yet')
-    if getattr(mf, 'with_df', None) is not None:
-        raise NotImplementedError('With density fitting is not supported yet')
 
     xI, yI = x_yI
     xJ, yJ = x_yJ
@@ -226,6 +259,8 @@ def get_nacv_ee(td_nac, x_yI, x_yJ, EI, EJ, singlet=True, atmlst=None, verbose=l
     xmyJ = (xJ - yJ)
     dmxpyJ = reduce(cp.dot, (orbv, xpyJ, orbo.T)) 
     dmxmyJ = reduce(cp.dot, (orbv, xmyJ, orbo.T)) 
+    td_nac._dmxpyI = dmxpyI
+    td_nac._dmxpyJ = dmxpyJ
 
     rIJoo =-contract('ai,aj->ij', xJ, xI) - contract('ai,aj->ij', yI, yJ)
     rIJvv = contract('ai,bi->ab', xI, xJ) + contract('ai,bi->ab', yJ, yI)
@@ -261,13 +296,16 @@ def get_nacv_ee(td_nac, x_yI, x_yJ, EI, EJ, singlet=True, atmlst=None, verbose=l
         vk2J = cp.asarray(vk2J)
 
     veff0doo = vj0IJ * 2 - vk0IJ
+    veff0doo += td_nac.solvent_response(dmzooIJ)
     wvo = reduce(cp.dot, (orbv.T, veff0doo, orbo)) * 2
     veffI = vj1I * 2 - vk1I
+    veffI += td_nac.solvent_response(dmxpyI + dmxpyI.T)
     veffI *= 0.5
     veff0mopI = reduce(cp.dot, (mo_coeff.T, veffI, mo_coeff))
     wvo -= contract("ki,ai->ak", veff0mopI[:nocc, :nocc], xpyJ) * 2  
     wvo += contract("ac,ai->ci", veff0mopI[nocc:, nocc:], xpyJ) * 2
     veffJ = vj1J * 2 - vk1J
+    veffJ += td_nac.solvent_response(dmxpyJ + dmxpyJ.T)
     veffJ *= 0.5
     veff0mopJ = reduce(cp.dot, (mo_coeff.T, veffJ, mo_coeff))
     wvo -= contract("ki,ai->ak", veff0mopJ[:nocc, :nocc], xpyI) * 2  
@@ -284,7 +322,7 @@ def get_nacv_ee(td_nac, x_yI, x_yJ, EI, EJ, singlet=True, atmlst=None, verbose=l
     wvo += contract("ac,ai->ci", veff0momJ[nocc:, nocc:], xmyI) * 2
     # The up parts are according to eq. (86) and (86) in Ref. [1]
 
-    vresp = mf.gen_response(singlet=None, hermi=1)
+    vresp = td_nac.base.gen_response(singlet=None, hermi=1)
 
     def fvind(x):
         dm = reduce(cp.dot, (orbv, x.reshape(nvir, nocc) * 2, orbo.T)) # double occupency
@@ -301,8 +339,7 @@ def get_nacv_ee(td_nac, x_yI, x_yJ, EI, EJ, singlet=True, atmlst=None, verbose=l
 
     z1ao = reduce(cp.dot, (orbv, z1, orbo.T))
     veff = vresp((z1ao + z1ao.T))
-    fock_matrix = mf.get_fock()
-    fock_mo = reduce(cp.dot, (mo_coeff.T, fock_matrix, mo_coeff))
+    fock_mo = cp.diag(mo_energy)
     TFoo = cp.dot(TIJoo, fock_mo[:nocc,:nocc])
     TFov = cp.dot(TIJoo, fock_mo[:nocc,nocc:])
     TFvo = cp.dot(TIJvv, fock_mo[nocc:,:nocc])
@@ -355,6 +392,7 @@ def get_nacv_ee(td_nac, x_yI, x_yJ, EI, EJ, singlet=True, atmlst=None, verbose=l
     s1 = mf_grad.get_ovlp(mol)
     z1aoS = (z1ao + z1ao.T)*0.5* (EJ - EI)
     dmz1doo = z1aoS + dmzooIJ  # P
+    td_nac._dmz1doo = dmz1doo
     oo0 = reduce(cp.dot, (orbo, orbo.T))*2  # D
 
     if atmlst is None:
@@ -373,45 +411,45 @@ def get_nacv_ee(td_nac, x_yI, x_yJ, EI, EJ, singlet=True, atmlst=None, verbose=l
     dvhf_all = 0
     dvhf = td_nac.get_veff(mol, dmz1doo + oo0) 
     for k, ia in enumerate(atmlst):
-        extra_force[k] += mf_grad.extra_force(ia, locals())
+        extra_force[k] += cp.asarray(mf_grad.extra_force(ia, locals()))
     dvhf_all += dvhf
     # minus in the next TWO terms is due to only <g^{(\xi)};{D,P_{IJ}}> is needed, 
     # thus minus the contribution from same DM ({D,D}, {P,P}).
     dvhf = td_nac.get_veff(mol, dmz1doo)
     for k, ia in enumerate(atmlst):
-        extra_force[k] -= mf_grad.extra_force(ia, locals())
+        extra_force[k] -= cp.asarray(mf_grad.extra_force(ia, locals()))
     dvhf_all -= dvhf
     dvhf = td_nac.get_veff(mol, oo0)
     for k, ia in enumerate(atmlst):
-        extra_force[k] -= mf_grad.extra_force(ia, locals())
+        extra_force[k] -= cp.asarray(mf_grad.extra_force(ia, locals()))
     dvhf_all -= dvhf
     j_factor=1.0
     k_factor=1.0
     dvhf = td_nac.get_veff(mol, (dmxpyI + dmxpyI.T + dmxpyJ + dmxpyJ.T), j_factor, k_factor)
     for k, ia in enumerate(atmlst):
-        extra_force[k] += mf_grad.extra_force(ia, locals())
+        extra_force[k] += cp.asarray(mf_grad.extra_force(ia, locals()))
     dvhf_all += dvhf
     # minus in the next TWO terms is due to only <g^{(\xi)};{R_I^S, R_J^S}> is needed, 
     # thus minus the contribution from same DM ({R_I^S,R_I^S} and {R_J^S,R_J^S}).
     dvhf = td_nac.get_veff(mol, (dmxpyI + dmxpyI.T), j_factor, k_factor)
     for k, ia in enumerate(atmlst):
-        extra_force[k] -= mf_grad.extra_force(ia, locals())
+        extra_force[k] -= cp.asarray(mf_grad.extra_force(ia, locals()))
     dvhf_all -= dvhf # NOTE: minus
     dvhf = td_nac.get_veff(mol, (dmxpyJ + dmxpyJ.T), j_factor, k_factor)
     for k, ia in enumerate(atmlst):
-        extra_force[k] -= mf_grad.extra_force(ia, locals())
+        extra_force[k] -= cp.asarray(mf_grad.extra_force(ia, locals()))
     dvhf_all -= dvhf
     dvhf = td_nac.get_veff(mol, (dmxmyI - dmxmyI.T + dmxmyJ - dmxmyJ.T), 0.0, k_factor, hermi=2)
     for k, ia in enumerate(atmlst):
-        extra_force[k] += mf_grad.extra_force(ia, locals())
+        extra_force[k] += cp.asarray(mf_grad.extra_force(ia, locals()))
     dvhf_all += dvhf
     dvhf = td_nac.get_veff(mol, (dmxmyI - dmxmyI.T), 0.0, k_factor, hermi=2)
     for k, ia in enumerate(atmlst):
-        extra_force[k] -= mf_grad.extra_force(ia, locals())
+        extra_force[k] -= cp.asarray(mf_grad.extra_force(ia, locals()))
     dvhf_all -= dvhf
     dvhf = td_nac.get_veff(mol, (dmxmyJ - dmxmyJ.T), 0.0, k_factor, hermi=2)
     for k, ia in enumerate(atmlst):
-        extra_force[k] -= mf_grad.extra_force(ia, locals())
+        extra_force[k] -= cp.asarray(mf_grad.extra_force(ia, locals()))
     dvhf_all -= dvhf
 
     delec = dh_td*2 - ds
@@ -451,13 +489,12 @@ class NAC(lib.StreamObject):
         "cphf_conv_tol",
         "mol",
         "base",
-        "chkfile",
         "states",
         "atmlst",
         "de",
         "de_scaled",
         "de_etf",
-        "de_etf_scaled"
+        "de_etf_scaled",
     }
 
     def __init__(self, td):
@@ -484,7 +521,6 @@ class NAC(lib.StreamObject):
         )
         log.info("cphf_conv_tol = %g", self.cphf_conv_tol)
         log.info("cphf_max_cycle = %d", self.cphf_max_cycle)
-        log.info("chkfile = %s", self.chkfile)
         log.info(f"States ID = {self.states}")
         log.info("\n")
         return self
@@ -600,9 +636,138 @@ class NAC(lib.StreamObject):
     def solvent_response(self, dm):
         return 0.0
 
-    as_scanner = NotImplemented
-
     to_gpu = lib.to_gpu
 
+    def reset(self, mol):
+        self.base.reset(mol)
+        self.mol = mol
+        return self
 
-tdscf.rhf.TDA.NAC = tdscf.rhf.TDHF.NAC = lib.class_as_method(NAC)
+    def as_scanner(nacv_instance, states=None):
+        if isinstance(nacv_instance, lib.GradScanner):
+            return nacv_instance
+
+        logger.info(nacv_instance, 'Create scanner for %s', nacv_instance.__class__)
+        name = nacv_instance.__class__.__name__ + NAC_Scanner.__name_mixin__
+        return lib.set_class(NAC_Scanner(nacv_instance, states),
+                            (NAC_Scanner, nacv_instance.__class__), name)
+
+    @classmethod
+    def from_cpu(cls, method):
+        td = method.base.to_gpu()
+        out = cls(td)
+        out.cphf_max_cycle = method.cphf_max_cycle
+        out.cphf_conv_tol = method.cphf_conv_tol
+        out.state = method.state
+        out.de = method.de
+        out.de_scaled = method.de_scaled
+        out.de_etf = method.de_etf
+        out.de_etf_scaled = method.de_etf_scaled
+        return out
+
+
+def check_phase_modified(mol0, mo_coeff0, mo1_reordered, xy0, xy1, nocc, s):
+    nao = mol0.nao
+    nvir = nao - nocc
+    
+    total_s_state = 0.0
+    num_to_consider = 5
+
+    top_indices0_flat = np.argsort(np.abs(xy0).flatten())[-num_to_consider:]
+    top_indices1_flat = np.argsort(np.abs(xy1).flatten())[-num_to_consider:]
+
+    for i in range(num_to_consider):
+        idx_l = top_indices0_flat[i]
+        idx_r = top_indices1_flat[i]
+
+        idxo_l = idx_l // nvir
+        idxv_l = idx_l % nvir
+        idxo_r = idx_r // nvir
+        idxv_r = idx_r % nvir
+
+        mo_coeff0_tmp = mo_coeff0[:, :nocc].copy()
+        mo_coeff1_tmp = mo1_reordered[:, :nocc].copy()
+        
+        mo_coeff0_tmp[:, idxo_l] = mo_coeff0[:, idxv_l + nocc]
+        mo_coeff1_tmp[:, idxo_r] = mo1_reordered[:, idxv_r + nocc]
+        
+        s_mo = mo_coeff0_tmp.T @ s @ mo_coeff1_tmp
+        
+        s_state_contribution = cp.linalg.det(s_mo) \
+            * xy0[idxo_l, idxv_l] * xy1[idxo_r, idxv_r] * 2
+
+        total_s_state += s_state_contribution
+
+    return total_s_state
+
+class NAC_Scanner(lib.GradScanner):
+
+    _keys = ['sign']
+
+    def __init__(self, nac_instance, states=None):
+        lib.GradScanner.__init__(self, nac_instance)
+        self.sign = 1.0
+        if states is not None:
+            self.states = states
+        else:
+            self.states = nac_instance.states
+
+    def __call__(self, mol_or_geom, states=None, **kwargs):
+        mol0 = self.mol.copy()
+        mo_coeff0 = self.base._scf.mo_coeff
+
+        if isinstance(mol_or_geom, gto.MoleBase):
+            assert mol_or_geom.__class__ == gto.Mole
+            mol = mol_or_geom
+        else:
+            mol = self.mol.set_geom_(mol_or_geom, inplace=False)
+
+        self.reset(mol)
+
+        if states is None:
+            states = self.states
+        else:
+            self.states = states
+        if states[0] != 0:
+            xi0, yi0 = self.base.xy[states[0]-1]
+        xj0, yj0 = self.base.xy[states[1]-1]
+
+        td_scanner = self.base
+
+        assert td_scanner.device == 'gpu'
+        assert self.device == 'gpu'
+        td_scanner(mol)
+        
+        s = gto.intor_cross('int1e_ovlp', mol0, mol)
+        mo_coeff = cp.asarray(self.base._scf.mo_coeff)
+        s = cp.asarray(s)
+        mo2_reordered, matching_indices, sign_array = match_and_reorder_mos(s, mo_coeff0, mo_coeff, threshold=0.4)
+        if states[0] != 0:
+            xi1, yi1 = self.base.xy[states[0]-1]
+        xj1, yj1 = self.base.xy[states[1]-1]
+        mo2_reordered = cp.asarray(mo2_reordered)
+        mo_coeff0 = cp.asarray(mo_coeff0)
+        mo_occ = cp.asarray(self.base._scf.mo_occ)
+        nao, nmo = mo_coeff.shape
+        nocc = int((mo_occ > 0).sum())
+
+        # for the first state
+        if states[0] != 0: # excited state
+            sign = check_phase_modified(mol0, mo_coeff0, mo2_reordered, xi0, xi1, nocc, s)
+            self.sign *= np.sign(sign)
+        else: # ground state
+            s_mo_ground = mo_coeff0[:, :nocc].T @ s @ mo2_reordered[:, :nocc]
+            s_ground = cp.linalg.det(s_mo_ground)
+            self.sign *= np.sign(s_ground)
+        # for the second state
+        sign = check_phase_modified(mol0, mo_coeff0, mo2_reordered, xj0, xj1, nocc, s)
+        self.sign *= np.sign(sign)
+        self.sign = float(self.sign)
+        e_tot = self.e_tot
+        
+        de, de_scaled, de_etf, de_etf_scaled= self.kernel(**kwargs)
+        de = de*self.sign
+        de_scaled = de_scaled*self.sign
+        de_etf = de_etf*self.sign
+        de_etf_scaled = de_etf_scaled*self.sign
+        return e_tot, de, de_scaled, de_etf, de_etf_scaled

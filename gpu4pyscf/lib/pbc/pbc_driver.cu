@@ -553,10 +553,6 @@ __constant__ int c_pair_offsets[L_AUX1*L_AUX1+1] = {
 extern __global__
 void ft_aopair_kernel(double *out, PBCIntEnvVars envs, AFTBoundsInfo bounds,
                       int compressing);
-extern __global__
-void ft_ao_bdiv_kernel(double *out, PBCIntEnvVars envs, int nGv, double *grids);
-extern __global__
-void ft_aopair_bdiv_kernel(double *out, PBCIntEnvVars envs, BDivAFTBoundsInfo bounds);
 
 extern __global__
 void pbc_int3c2e_kernel(double *out, PBCIntEnvVars envs, PBCInt3c2eBounds bounds);
@@ -573,20 +569,19 @@ int build_ft_aopair(double *out, int compressing, PBCIntEnvVars *envs,
                     int *bas_ij, double *grids, int *img_offsets, int *img_idx,
                     int *atm, int natm, int *bas, int nbas, double *env)
 {
-    uint16_t ish0 = shls_slice[0];
-    uint16_t jsh0 = shls_slice[2];
-    uint8_t li = bas[ANG_OF + ish0*BAS_SLOTS];
-    uint8_t lj = bas[ANG_OF + jsh0*BAS_SLOTS];
-    uint8_t iprim = bas[NPRIM_OF + ish0*BAS_SLOTS];
-    uint8_t jprim = bas[NPRIM_OF + jsh0*BAS_SLOTS];
-    uint8_t nfi = (li+1)*(li+2)/2;
-    uint8_t nfj = (lj+1)*(lj+2)/2;
-    uint8_t nfij = nfi * nfj;
-    uint8_t stride_i = 1;
-    uint8_t stride_j = li + 1;
+    int ish0 = shls_slice[0];
+    int jsh0 = shls_slice[2];
+    int li = bas[ANG_OF + ish0*BAS_SLOTS];
+    int lj = bas[ANG_OF + jsh0*BAS_SLOTS];
+    int iprim = bas[NPRIM_OF + ish0*BAS_SLOTS];
+    int jprim = bas[NPRIM_OF + jsh0*BAS_SLOTS];
+    int nfi = (li+1)*(li+2)/2;
+    int nfj = (lj+1)*(lj+2)/2;
+    int stride_i = 1;
+    int stride_j = li + 1;
     // up to g functions
-    uint8_t g_size = stride_j * (uint16_t)(lj + 1);
-    AFTBoundsInfo bounds = {li, lj, nfij, g_size,
+    int g_size = stride_j * (lj + 1);
+    AFTBoundsInfo bounds = {li, lj, nfi, nfj, g_size,
         stride_i, stride_j, iprim, jprim,
         npairs_ij, ngrids, bas_ij, grids, img_offsets, img_idx};
 
@@ -610,54 +605,37 @@ int build_ft_aopair(double *out, int compressing, PBCIntEnvVars *envs,
     return 0;
 }
 
-int build_ft_ao(double *out, PBCIntEnvVars *envs, int ngrids, double *grids,
-                int *atm, int natm, int *bas, int nbas, double *env)
-{
-    int nsh_per_block = FT_AO_THREADS/NG_PER_BLOCK;
-    dim3 threads(NG_PER_BLOCK, nsh_per_block);
-    int nbatches_grids = (ngrids + NG_PER_BLOCK - 1) / NG_PER_BLOCK;
-    int nbatches_shls = (nbas + nsh_per_block - 1) / nsh_per_block;
-    dim3 blocks(nbatches_shls, nbatches_grids);
-    ft_ao_bdiv_kernel<<<blocks, threads>>>(out, *envs, ngrids, grids);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "CUDA Error in ft_aopair_bdiv_kernel: %s\n", cudaGetErrorString(err));
-        return 1;
-    }
-    return 0;
-}
-
 int fill_int3c2e(double *out, PBCIntEnvVars *envs, int *scheme, int *shls_slice,
                  int naux, int n_prim_pairs, int n_ctr_pairs,
-                 int *bas_ij_idx, int *pair_mapping, int *img_idx, int *img_offsets,
+                 int *bas_ij_idx, int *pair_mapping, int *img_idx, uint32_t *img_offsets,
                  int *atm, int natm, int *bas, int nbas, double *env)
 {
-    uint16_t ish0 = shls_slice[0];
-    uint16_t jsh0 = shls_slice[2];
-    uint16_t ksh0 = shls_slice[4] + nbas;
-    uint16_t ksh1 = shls_slice[5] + nbas;
-    uint16_t nksh = ksh1 - ksh0;
-    uint8_t li = bas[ANG_OF + ish0*BAS_SLOTS];
-    uint8_t lj = bas[ANG_OF + jsh0*BAS_SLOTS];
-    uint8_t lk = bas[ANG_OF + ksh0*BAS_SLOTS];
-    uint8_t kprim = bas[NPRIM_OF + ksh0*BAS_SLOTS];
-    uint8_t nfi = (li+1)*(li+2)/2;
-    uint8_t nfj = (lj+1)*(lj+2)/2;
-    uint8_t nfk = (lk+1)*(lk+2)/2;
-    uint8_t nfij = nfi * nfj;
-    uint8_t order = li + lj + lk;
-    uint8_t nroots = order / 2 + 1;
+    int ish0 = shls_slice[0];
+    int jsh0 = shls_slice[2];
+    int ksh0 = shls_slice[4] + nbas;
+    int ksh1 = shls_slice[5] + nbas;
+    int nksh = ksh1 - ksh0;
+    int li = bas[ANG_OF + ish0*BAS_SLOTS];
+    int lj = bas[ANG_OF + jsh0*BAS_SLOTS];
+    int lk = bas[ANG_OF + ksh0*BAS_SLOTS];
+    int kprim = bas[NPRIM_OF + ksh0*BAS_SLOTS];
+    int nfi = (li+1)*(li+2)/2;
+    int nfj = (lj+1)*(lj+2)/2;
+    int nfk = (lk+1)*(lk+2)/2;
+    int nfij = nfi * nfj;
+    int order = li + lj + lk;
+    int nroots = order / 2 + 1;
     double omega = env[PTR_RANGE_OMEGA];
     if (omega < 0) { // SR ERIs
         nroots *= 2;
     }
-    uint8_t stride_j = li + 1;
-    uint8_t stride_k = stride_j * (lj + 1);
+    int stride_j = li + 1;
+    int stride_k = stride_j * (lj + 1);
     // up to (gg|i)
-    uint8_t g_size = stride_k * (lk + 1);
+    int g_size = stride_k * (lk + 1);
     PBCInt3c2eBounds bounds = {
-        (uint8_t)li, (uint8_t)lj, lk, nroots, nfij, nfk, kprim,
-        stride_j, stride_k, g_size, (uint16_t)naux, (uint16_t)nksh, (uint16_t)ksh0,
+        li, lj, lk, nroots, nfij, nfk, kprim,
+        stride_j, stride_k, g_size, naux, nksh, ksh0,
         n_prim_pairs, n_ctr_pairs,
         bas_ij_idx, pair_mapping, img_offsets, img_idx
     };
@@ -667,7 +645,7 @@ int fill_int3c2e(double *out, PBCIntEnvVars *envs, int *scheme, int *shls_slice,
         int gout_stride = scheme[1];
         int nsp_per_block = scheme[2];
         dim3 threads(nksh_per_block, gout_stride, nsp_per_block);
-        int tasks_per_block = SPTAKS_PER_BLOCK * nsp_per_block;
+        int tasks_per_block = SPTASKS_PER_BLOCK * nsp_per_block;
         int sp_blocks = (n_prim_pairs + tasks_per_block - 1) / tasks_per_block;
         int ksh_blocks = (nksh + nksh_per_block - 1) / nksh_per_block;
         dim3 blocks(sp_blocks, ksh_blocks);
@@ -693,7 +671,7 @@ int fill_int2c2e(double *out, PBCIntEnvVars *envs, int shm_size,
     pbc_int2c2e_kernel<<<nbatches_shl_pair, THREADS, shm_size>>>(out, *envs, bounds);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "CUDA Error in int2ce kernel: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "CUDA Error in int2c2e kernel: %s\n", cudaGetErrorString(err));
         return 1;
     }
     return 0;

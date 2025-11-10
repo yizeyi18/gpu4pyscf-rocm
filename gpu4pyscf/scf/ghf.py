@@ -52,6 +52,7 @@ class GHF(hf.SCF):
     #_finalize = ghf_cpu.GHF._finalize
 
     get_grad = return_cupy_array(ghf_cpu.GHF.get_grad)
+    energy_elec = hf.energy_elec
 
     def get_init_guess(self, mol=None, key='minao', **kwargs):
         dma = hf.RHF.get_init_guess(self, mol, key, **kwargs)
@@ -109,7 +110,7 @@ class GHF(hf.SCF):
         dmab = dm[:,:nao,nao:]
         dmba = dm[:,nao:,:nao]
         dm = cp.vstack((dmaa, dmbb, dmab, dmba))
-        ktmp = hf._get_jk(self, mol, dm, hermi=0, with_j=False, omega=omega)[1]
+        ktmp = super().get_k(mol, dm, hermi=0, omega=omega)
         ktmp = ktmp.reshape(4,n_dm,nao,nao)
         vk = cp.zeros((n_dm,nso,nso), dm.dtype)
         vk[:,:nao,:nao] = ktmp[0]

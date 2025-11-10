@@ -25,9 +25,9 @@ from gpu4pyscf.lib import logger
 from gpu4pyscf.lib.cupy_helper import (
     contract, transpose_sum, reduce_to_device, tag_array)
 from gpu4pyscf.dft import rks, uks, numint
-from gpu4pyscf.scf import hf, uhf
+from gpu4pyscf.scf import hf, uhf, rohf
 from gpu4pyscf.df import df, int3c2e
-from gpu4pyscf.__config__ import _streams, num_devices
+from gpu4pyscf.__config__ import num_devices
 
 def _pin_memory(array):
     mem = cupy.cuda.alloc_pinned_memory(array.nbytes)
@@ -118,6 +118,9 @@ class _DFHF:
     def get_j(self, mol=None, dm=None, hermi=1, omega=None):
         return self.with_df.get_jk(dm, hermi, True, False, self.direct_scf_tol, omega)[0]
 
+    def get_k(self, mol=None, dm=None, hermi=1, omega=None):
+        return self.with_df.get_jk(dm, hermi, False, True, self.direct_scf_tol, omega)[1]
+
     def get_jk(self, mol=None, dm=None, hermi=1, with_j=True, with_k=True,
                omega=None):
         if dm is None: dm = self.make_rdm1()
@@ -192,43 +195,23 @@ class _DFHF:
         if dm is None: dm = self.make_rdm1()
         assert not self.direct_scf
 
+        if isinstance(self, rohf.ROHF):
+            if getattr(dm, 'mo_coeff', None) is not None:
+                mo_coeff = cupy.repeat(dm.mo_coeff[None], 2, axis=0)
+                mo_occ = cupy.asarray([dm.mo_occ>0, dm.mo_occ==2],
+                                      dtype=numpy.double)
+                if dm.ndim == 2:  # RHF DM
+                    dm = cupy.repeat(dm[None]*.5, 2, axis=0)
+                dm = tag_array(dm, mo_coeff=mo_coeff, mo_occ=mo_occ)
+            elif dm.ndim == 2:  # RHF DM
+                dm = cupy.repeat(dm[None]*.5, 2, axis=0)
+
         # for DFT
         if isinstance(self, rks.KohnShamDFT):
             t0 = logger.init_timer(self)
             rks.initialize_grids(self, mol, dm)
             ni = self._numint
-            if dm.ndim == 2: # RKS
-                n, exc, vxc = ni.nr_rks(mol, self.grids, self.xc, dm)
-                logger.debug(self, 'nelec by numeric integration = %s', n)
-                if self.do_nlc():
-                    if ni.libxc.is_nlc(self.xc):
-                        xc = self.xc
-                    else:
-                        assert ni.libxc.is_nlc(self.nlc)
-                        xc = self.nlc
-                    n, enlc, vnlc = ni.nr_nlc_vxc(mol, self.nlcgrids, xc, dm)
-                    exc += enlc
-                    vxc += vnlc
-                    logger.debug(self, 'nelec with nlc grids = %s', n)
-                t0 = logger.timer_debug1(self, 'vxc tot', *t0)
-
-                if not ni.libxc.is_hybrid_xc(self.xc):
-                    vj = self.get_j(mol, dm, hermi)
-                    vxc += vj
-                else:
-                    omega, alpha, hyb = ni.rsh_and_hybrid_coeff(self.xc, spin=mol.spin)
-                    vj, vk = self.get_jk(mol, dm, hermi)
-                    vxc += vj
-                    vk *= hyb
-                    if omega != 0:
-                        vklr = self.get_k(mol, dm, hermi, omega=abs(omega))
-                        vklr *= (alpha - hyb)
-                        vk += vklr
-                    vxc -= vk * .5
-                    exc -= cupy.einsum('ij,ji', dm, vk).real * .25
-                ecoul = cupy.einsum('ij,ji', dm, vj).real * .5
-
-            elif dm.ndim == 3: # UKS
+            if isinstance(self, (uhf.UHF, rohf.ROHF)): # UKS
                 n, exc, vxc = ni.nr_uks(mol, self.grids, self.xc, dm)
                 logger.debug(self, 'nelec by numeric integration = %s', n)
                 if self.do_nlc():
@@ -259,17 +242,51 @@ class _DFHF:
                     vxc -= vk
                     exc -= cupy.einsum('sij,sji->', dm, vk).real * .5
                 ecoul = cupy.einsum('sij,ji->', dm, vj).real * .5
-            t0 = logger.timer_debug1(self, 'jk total', *t0)
+
+            elif isinstance(self, hf.RHF):
+                n, exc, vxc = ni.nr_rks(mol, self.grids, self.xc, dm)
+                logger.debug(self, 'nelec by numeric integration = %s', n)
+                if self.do_nlc():
+                    if ni.libxc.is_nlc(self.xc):
+                        xc = self.xc
+                    else:
+                        assert ni.libxc.is_nlc(self.nlc)
+                        xc = self.nlc
+                    n, enlc, vnlc = ni.nr_nlc_vxc(mol, self.nlcgrids, xc, dm)
+                    exc += enlc
+                    vxc += vnlc
+                    logger.debug(self, 'nelec with nlc grids = %s', n)
+                t0 = logger.timer(self, 'vxc', *t0)
+
+                if not ni.libxc.is_hybrid_xc(self.xc):
+                    vj = self.get_j(mol, dm, hermi)
+                    vxc += vj
+                else:
+                    omega, alpha, hyb = ni.rsh_and_hybrid_coeff(self.xc, spin=mol.spin)
+                    vj, vk = self.get_jk(mol, dm, hermi)
+                    vxc += vj
+                    vk *= hyb
+                    if omega != 0:
+                        vklr = self.get_k(mol, dm, hermi, omega=abs(omega))
+                        vklr *= (alpha - hyb)
+                        vk += vklr
+                    vxc -= vk * .5
+                    exc -= cupy.einsum('ij,ji', dm, vk).real * .25
+                ecoul = cupy.einsum('ij,ji', dm, vj).real * .5
+
+            else:
+                raise NotImplementedError("DF only supports R/U/RO KS.")
+            t0 = logger.timer(self, 'veff', *t0)
             return tag_array(vxc, ecoul=ecoul, exc=exc, vj=None, vk=None)
 
-        if dm.ndim == 2:
-            vj, vk = self.get_jk(mol, dm, hermi=hermi)
-            return vj - vk * .5
-        elif dm.ndim == 3:
+        if isinstance(self, (uhf.UHF, rohf.ROHF)):
             vj, vk = self.get_jk(mol, dm, hermi=hermi)
             return vj[0] + vj[1] - vk
+        elif isinstance(self, hf.RHF):
+            vj, vk = self.get_jk(mol, dm, hermi=hermi)
+            return vj - vk * .5
         else:
-            raise NotImplementedError("Please check the dimension of the density matrix, it should not reach here.")
+            raise NotImplementedError("DF only supports R/U/RO HF.")
 
     def to_cpu(self):
         obj = self.undo_df().to_cpu().density_fit()
@@ -279,7 +296,7 @@ def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
                      with_j=True, with_k=True, hermi=0, device_id=0):
     ''' Calculate J and K matrices on single GPU
     '''
-    with cupy.cuda.Device(device_id), _streams[device_id]:
+    with cupy.cuda.Device(device_id):
         assert isinstance(dfobj.verbose, int)
         log = logger.new_logger(dfobj.mol, dfobj.verbose)
         t0 = log.init_timer()
@@ -344,7 +361,7 @@ def _jk_task_with_mo1(dfobj, dms, mo1s, occ_coeffs,
         For CP-HF or TDDFT
     '''
     vj = vk = None
-    with cupy.cuda.Device(device_id), _streams[device_id]:
+    with cupy.cuda.Device(device_id):
         assert isinstance(dfobj.verbose, int)
         log = logger.new_logger(dfobj.mol, dfobj.verbose)
         t0 = log.init_timer()
@@ -405,7 +422,7 @@ def _jk_task_with_mo1(dfobj, dms, mo1s, occ_coeffs,
 def _jk_task_with_dm(dfobj, dms, with_j=True, with_k=True, hermi=0, device_id=0):
     ''' Calculate J and K matrices with density matrix
     '''
-    with cupy.cuda.Device(device_id), _streams[device_id]:
+    with cupy.cuda.Device(device_id):
         assert isinstance(dfobj.verbose, int)
         log = logger.new_logger(dfobj.mol, dfobj.verbose)
         t0 = log.init_timer()

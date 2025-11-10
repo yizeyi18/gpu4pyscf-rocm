@@ -81,7 +81,6 @@ class ROHF(hf.RHF):
     get_occ = hf.return_cupy_array(rohf_cpu.ROHF.get_occ)
     get_hcore = hf.RHF.get_hcore
     get_ovlp = hf.RHF.get_ovlp
-    get_veff = uhf.UHF.get_veff
     get_init_guess = uhf.UHF.get_init_guess
     init_guess_by_minao      = rohf_cpu.ROHF.init_guess_by_minao
     init_guess_by_atom       = rohf_cpu.ROHF.init_guess_by_atom
@@ -98,7 +97,6 @@ class ROHF(hf.RHF):
     to_uks = NotImplemented
     to_gks = NotImplemented
     to_ks = NotImplemented
-    analyze = NotImplemented
     stability = NotImplemented
     mulliken_pop = NotImplemented
     mulliken_meta = NotImplemented
@@ -121,7 +119,15 @@ class ROHF(hf.RHF):
         return tag_array((dm_a, dm_b), mo_coeff=mo_coeff, mo_occ=mo_occ)
 
     def eig(self, fock, s):
-        e, c = self._eigh(fock, s)
+        x = None
+        if hasattr(self, 'overlap_canonical_decomposed_x') and self.overlap_canonical_decomposed_x is not None:
+            x = cupy.asarray(self.overlap_canonical_decomposed_x)
+        if x is None:
+            e, c = self._eigh(fock, s)
+        else:
+            e, c = cupy.linalg.eigh(x.T @ fock @ x)
+            c = x @ c
+
         if getattr(fock, 'focka', None) is not None:
             mo_ea = contract('pi,pi->i', c.conj(), fock.focka.dot(c)).real
             mo_eb = contract('pi,pi->i', c.conj(), fock.fockb.dot(c)).real
@@ -133,6 +139,20 @@ class ROHF(hf.RHF):
         elif isinstance(dm, cupy.ndarray) and dm.ndim == 2:
             dm = [dm*.5, dm*.5]
         return uhf.energy_elec(self, dm, h1e, vhf)
+
+    def get_veff(self, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
+        if dm is None:
+            dm = self.make_rdm1()
+        elif getattr(dm, 'mo_coeff', None) is not None:
+            mo_coeff = cupy.repeat(dm.mo_coeff[None], 2, axis=0)
+            mo_occ = cupy.asarray([dm.mo_occ>0, dm.mo_occ==2],
+                                  dtype=np.double)
+            if dm.ndim == 2:  # RHF DM
+                dm = cupy.repeat(dm[None]*.5, 2, axis=0)
+            dm = tag_array(dm, mo_coeff=mo_coeff, mo_occ=mo_occ)
+        elif dm.ndim == 2:  # RHF DM
+            dm = cupy.repeat(dm[None]*.5, 2, axis=0)
+        return uhf.UHF.get_veff(self, mol, dm, dm_last, vhf_last, hermi)
 
     def get_fock(self, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1, diis=None,
                  diis_start_cycle=None, level_shift_factor=None, damp_factor=None,
@@ -166,7 +186,7 @@ class ROHF(hf.RHF):
         if 0 <= cycle < diis_start_cycle-1 and abs(damp_factor) > 1e-4 and fock_last is not None:
             raise NotImplementedError('ROHF Fock-damping')
         if diis and cycle >= diis_start_cycle:
-            f = diis.update(s1e, dm_tot, f, self, h1e, vhf, f_prev=fock_last)
+            f = diis.update(s1e, dm_tot, f)
         if abs(level_shift_factor) > 1e-4:
             f = hf.level_shift(s1e, dm_tot*.5, f, level_shift_factor)
         f = tag_array(f, focka=focka, fockb=fockb)

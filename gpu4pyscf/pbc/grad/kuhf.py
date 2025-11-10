@@ -22,7 +22,7 @@ import cupy as cp
 from pyscf import lib
 from gpu4pyscf.lib import logger
 from gpu4pyscf.pbc.grad import krhf as krhf_grad
-from gpu4pyscf.lib.cupy_helper import contract
+from gpu4pyscf.lib.cupy_helper import contract, ensure_numpy
 
 __all__ = ['Gradients']
 
@@ -57,7 +57,7 @@ def grad_elec(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
     for ia in range(natm):
         h1ao = hcore_deriv(ia)
         dh1e[ia] = cp.einsum('kxij,kji->x', h1ao, dm0_sf).real
-        extra_force[ia] = mf_grad.extra_force(ia, locals())
+        extra_force[ia] = ensure_numpy(mf_grad.extra_force(ia, locals()))
     log.timer('gradients of 1e part', *t1)
 
     # nabla is applied on bra in vhf. *2 for the contributions of nabla|ket>
@@ -74,11 +74,18 @@ def grad_elec(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
 class Gradients(krhf_grad.GradientsBase):
     '''Non-relativistic restricted Hartree-Fock gradients'''
 
-    def get_veff(self, dm=None, kpts=None):
-        if dm is None: dm = self.base.make_rdm1()
-        ej = self.get_j(dm[0]+dm[1], kpts)
-        ek = self.get_k(dm, kpts)
-        return ej - ek
+    def get_veff(self, dm, kpts):
+        if self.base.rsjk is not None:
+            from gpu4pyscf.pbc.scf.rsjk import PBCJKMatrixOpt
+            with_rsjk = self.base.rsjk
+            assert isinstance(with_rsjk, PBCJKMatrixOpt)
+            ejk = with_rsjk._get_ejk_sr_ip1(dm, kpts, exxdiv=self.base.exxdiv)
+            ejk += with_rsjk._get_ejk_lr_ip1(dm, kpts, exxdiv=self.base.exxdiv)
+        else:
+            ej = self.get_j(dm[0]+dm[1], kpts)
+            ek = self.get_k(dm, kpts)
+            ejk = ej - ek
+        return ejk
 
     def make_rdm1e(self, mo_energy=None, mo_coeff=None, mo_occ=None):
         '''Energy weighted density matrix'''
