@@ -329,6 +329,8 @@ class SMD(lib.StreamObject):
 
     @solvent.setter
     def solvent(self, solvent):
+        if solvent not in solvent_db:
+            raise RuntimeError(f'{solvent} is not available in SMD')
         self._solvent = solvent
         self.solvent_descriptors = solvent_db[solvent]
         self.radii_table = smd_radii(self.solvent_descriptors[2])

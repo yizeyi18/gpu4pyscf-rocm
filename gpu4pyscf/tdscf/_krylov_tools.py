@@ -17,7 +17,7 @@ import sys
 import scipy.linalg
 
 from gpu4pyscf.tdscf import math_helper
-from gpu4pyscf.lib import logger, cusolver
+from gpu4pyscf.lib import logger, rocsolver
 from functools import partial
 from pyscf.data.nist import HARTREE2EV
 

@@ -47,6 +47,44 @@ libvhf_rys.cuda_version.restype = ctypes.c_int
 CUDA_VERSION = libvhf_rys.cuda_version()
 libgint = load_library('libgint')
 
+class RysIntEnvVars(ctypes.Structure):
+    _fields_ = [
+        ('natm', ctypes.c_uint16),
+        ('nbas', ctypes.c_uint16),
+        ('atm', ctypes.c_void_p),
+        ('bas', ctypes.c_void_p),
+        ('env', ctypes.c_void_p),
+        ('ao_loc', ctypes.c_void_p),
+    ]
+
+libvhf_rys.RYS_build_jk.argtypes = [
+    ctypes.c_void_p,  # vj
+    ctypes.c_void_p,  # vk
+    ctypes.c_void_p,  # dm
+    ctypes.c_int,     # n_dm
+    ctypes.c_int,     # nao
+    RysIntEnvVars, # should be a structure
+    ctypes.c_void_p,  # scheme
+    ctypes.c_void_p,  # shls_slice
+    ctypes.c_int,     # ntile_ij_pairs
+    ctypes.c_int,     # ntile_kl_pairs
+    ctypes.c_void_p,  # tile_ij_mapping
+    ctypes.c_void_p,  # tile_kl_mapping
+    ctypes.c_void_p,  # tile_q_cond
+    ctypes.c_void_p,  # q_cond
+    ctypes.c_void_p,  # s_estimator
+    ctypes.c_void_p,  # dm_cond
+    ctypes.c_float,   # cutoff
+    ctypes.c_void_p,  # pool
+    ctypes.c_void_p,  # batch_head
+    ctypes.c_int,     # workers
+    ctypes.c_void_p,  # atm
+    ctypes.c_int,     # natm
+    ctypes.c_void_p,  # bas
+    ctypes.c_int,     # nbas
+    ctypes.c_void_p,  # env
+]
+
 PTR_BAS_COORD = 7
 LMAX = 4
 TILE = 2
@@ -713,7 +751,7 @@ class _VHFOpt:
                     mol._bas.ctypes, ctypes.c_int(mol.nbas), mol._env.ctypes)
                 if err != 0:
                     llll = f'({l_symb[i]}{l_symb[j]}|{l_symb[k]}{l_symb[l]})'
-                    raise RuntimeError(f'RYS_build_j kernel for {llll} failed')
+                    raise RuntimeError(f'RYS_build_j kernel for {llll} failed with err = {err}')
                 if log.verbose >= logger.DEBUG1:
                     llll = f'({l_symb[i]}{l_symb[j]}|{l_symb[k]}{l_symb[l]})'
                     t1, t1p = log.timer_debug1(f'processing {llll}, tasks = {info[1]}', *t1), t1
@@ -762,16 +800,6 @@ class _VHFOpt:
             vj1 = asarray(vs_h[0])
             vj += hermi_triu(vj1)
         return vj
-
-class RysIntEnvVars(ctypes.Structure):
-    _fields_ = [
-        ('natm', ctypes.c_uint16),
-        ('nbas', ctypes.c_uint16),
-        ('atm', ctypes.c_void_p),
-        ('bas', ctypes.c_void_p),
-        ('env', ctypes.c_void_p),
-        ('ao_loc', ctypes.c_void_p),
-    ]
 
 def _scale_sp_ctr_coeff(mol):
     # Match normalization factors of s, p functions in libcint

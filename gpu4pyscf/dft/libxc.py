@@ -41,8 +41,9 @@ for path in path_list:
     try:
         _libxc = np.ctypeslib.load_library('libxc', libxc_path)
         break
-    except Exception:
-        _libxc = None
+    except Exception as e:
+        raise RuntimeError(f"{e}")
+        #_libxc = None
 
 libgdft = load_library('libgdft')
 libgdft.GDFT_xc_lda.argtypes = (

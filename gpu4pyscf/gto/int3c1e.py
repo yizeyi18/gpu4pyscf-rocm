@@ -361,7 +361,7 @@ def get_int3c1e_charge_contracted(mol, grids, charge_exponents, charges, intopt)
             ctypes.c_int(n_charge_sum_per_thread))
 
         if err != 0:
-            raise RuntimeError('GINTfill_int3c1e_charge_contracted failed')
+            raise RuntimeError(f'GINTfill_int3c1e_charge_contracted failed, err = {err}')
 
         i0, i1 = intopt.ao_loc[cpi], intopt.ao_loc[cpi+1]
         j0, j1 = intopt.ao_loc[cpj], intopt.ao_loc[cpj+1]
