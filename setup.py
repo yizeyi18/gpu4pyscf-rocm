@@ -83,8 +83,10 @@ def detect_gpu_backend() -> str:
     backend = os.environ.get('GPU4PYSCF_GPU_BACKEND')
     if backend is None:
         backend = os.environ.get('GPU4PYSCF_BACKEND')
-    if backend is None:
+    if backend is None and not get_hip_version is None:
         backend = 'HIP'
+    else:
+        backend = 'CUDA'
     return normalize_backend(backend)
 
 
@@ -159,6 +161,7 @@ class CMakeBuildPy(build_py):
             if hip_arch:
                 cmd.append(f'-DCMAKE_HIP_ARCHITECTURES={hip_arch}')
             cmd.append('-DBUILD_CUTLASS=OFF')
+            cmd.append('-DCMAKE_HIP_FLAGS=-Wno-unused-result')
         configure_args = os.getenv('CMAKE_CONFIGURE_ARGS')
         if configure_args:
             cmd.extend(shlex.split(configure_args))
