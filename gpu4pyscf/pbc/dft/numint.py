@@ -114,8 +114,17 @@ def eval_ao_kpts(cell, coords, kpts=None, deriv=0, relativity=0,
     else:
         bvk_ncells, nkpts = opt.expLk.shape
         expLk = opt.expLk.view(np.float64).reshape(bvk_ncells, nkpts, 2)
-        out = contract('Lks,cLig->kcigs', expLk, out)
-        out = out.view(np.complex128)[:,:,:,:,0].transpose(0,1,3,2)
+        # contract('Lks,cLig->kcigs', expLk, out) in one shot may need a full
+        # transposed copy of `out` inside cupy.einsum on HIP, which can exceed
+        # the GPU memory for large bvk cells (e.g. random k-points).  Chunk the
+        # grid dimension so the einsum operands stay bounded in memory.
+        ao = cp.empty((nkpts, comp, ngrids, nao, 2), order='C')
+        gchunk = max(1, int(2**30 // (comp * bvk_ncells * nao * 8)))
+        for g0 in range(0, ngrids, gchunk):
+            g1 = min(ngrids, g0 + gchunk)
+            tmp = contract('Lks,cLig->kcigs', expLk, out[:, :, :, g0:g1])
+            ao[:, :, g0:g1, :, :] = tmp.transpose(0, 1, 3, 2, 4)
+        out = ao.view(np.complex128)[:, :, :, :, 0]
 
     if deriv == 0:
         out = out[:,0]

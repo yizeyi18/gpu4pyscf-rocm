@@ -22,6 +22,12 @@ from gpu4pyscf import scf, dft, lib
 from gpu4pyscf.solvent.hessian import smd as smd_hess
 from gpu4pyscf.solvent.grad import smd as smd_grad
 from gpu4pyscf.solvent import smd
+try:
+    from pyscf.solvent import smd as _smd_cpu
+    HAS_PYSCF_SMD = getattr(_smd_cpu, 'libsolvent', None) is not None
+except ImportError:
+    HAS_PYSCF_SMD = False
+
 from packaging.version import Version
 
 def setUpModule():
@@ -225,6 +231,7 @@ H -0.646 -0.464 -0.804
 
     #@unittest.skipIf(Version(pyscf.__version__) <= Version('2.11.0'),
     #                 'bug for SMD.radii_table in pyscf')
+    @unittest.skipUnless(HAS_PYSCF_SMD, "pyscf built without the SMD module (ENABLE_SMD=ON)")
     def test_to_gpu_to_cpu(self):
         mf = dft.RKS(mol, xc='b3lyp').SMD()
         mf.conv_tol = 1e-12

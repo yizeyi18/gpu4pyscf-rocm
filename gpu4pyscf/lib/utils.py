@@ -119,6 +119,11 @@ def format_sys_info():
     cuda_version = f"{cuda_version // 1000}.{(cuda_version % 1000) // 10}"
 
     runtime_info = get_runtime_info()
+    def _runtime_attr(name):
+        try:
+            return getattr(runtime_info, name)
+        except Exception:
+            return 'N/A'
     result = [
         f'System: {platform.uname()}  Threads {lib.num_threads()}',
         f'Python {sys.version}',
@@ -127,16 +132,16 @@ def format_sys_info():
         f'Date: {time.ctime()}',
         f'PySCF version {pyscf.__version__}',
         f'PySCF path  {pyscf_info["path"]}',
-        'CUDA Environment',
+        'GPU Environment',
         f'    CuPy {runtime_info.cupy_version}',
-        f'    CUDA Path {runtime_info.cuda_path}',
-        f'    CUDA Build Version {runtime_info.cuda_build_version}',
-        f'    CUDA Driver Version {runtime_info.cuda_driver_version}',
-        f'    CUDA Runtime Version {runtime_info.cuda_runtime_version}',
-        'CUDA toolkit',
-        f'    cuSolver {runtime_info.cusolver_version}',
-        f'    cuBLAS {runtime_info.cublas_version}',
-        f'    cuTENSOR {runtime_info.cutensor_version}',
+        f'    CUDA Path {_runtime_attr("cuda_path")}',
+        f'    CUDA Build Version {_runtime_attr("cuda_build_version")}',
+        f'    CUDA Driver Version {_runtime_attr("cuda_driver_version")}',
+        f'    CUDA Runtime Version {_runtime_attr("cuda_runtime_version")}',
+        'GPU library',
+        f'    cuSolver {_runtime_attr("cusolver_version")}',
+        f'    cuBLAS {_runtime_attr("cublas_version")}',
+        f'    cuTENSOR {_runtime_attr("cutensor_version")}',
         'Device info',
         f'    Device name {device_props["name"]}',
         f'    Device global memory {device_props["totalGlobalMem"] / 1024**3:.2f} GB',

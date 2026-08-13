@@ -22,6 +22,7 @@ min_ao_blksize = 256        # maxisum batch size of AOs
 min_grid_blksize = 64*64    # maximum batch size of grids for DFT
 ao_aligned = 32             # global AO alignment for slicing
 grid_aligned = 256          # 256 alignment for grids globally
+backend = "HIP" if cupy.cuda.runtime.is_hip else "CUDA"
 
 # Use smaller blksize for old gaming GPUs
 if props['totalGlobalMem'] < 16 * GB:
@@ -32,7 +33,7 @@ if props['totalGlobalMem'] < 16 * GB:
 mem_fraction = 0.9
 cupy.get_default_memory_pool().set_limit(fraction=mem_fraction)
 
-if props['sharedMemPerBlockOptin'] > 65536:
+if props.get('sharedMemPerBlockOptin', 0) > 65536:
     shm_size = props['sharedMemPerBlockOptin']
     # Resever space for system use
     shm_size -= 2048

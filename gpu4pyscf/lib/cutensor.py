@@ -55,6 +55,11 @@ def _create_tensor_descriptor(a):
 def _contract_einsum(pattern, a, b, alpha, beta, out=None, einsum=cupy.einsum):
     if out is None:
         out = einsum(pattern, a, b)
+        # einsum may return a non-contiguous view when some dimensions are
+        # singleton (e.g. cupy.einsum('xrij,ysij->xrys', ...) with naux == 1).
+        # Callers often reshape the result, so make sure it is C-contiguous.
+        if cupy.cuda.runtime.is_hip and not out.flags.c_contiguous:
+            out = cupy.ascontiguousarray(out)
         out *= alpha
     elif beta == 0.:
         out[:] = einsum(pattern, a, b)

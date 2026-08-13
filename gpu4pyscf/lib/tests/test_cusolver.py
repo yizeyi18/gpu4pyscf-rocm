@@ -16,7 +16,10 @@ import unittest
 import numpy as np
 import scipy.linalg
 import cupy as cp
-from gpu4pyscf.lib.cusolver import eigh, cholesky
+if not cp.cuda.runtime.is_hip:
+    from gpu4pyscf.lib.cusolver import eigh, cholesky
+else:
+    from gpu4pyscf.lib.rocsolver import eigh, cholesky
 
 def test_eigh_real():
     np.random.seed(6)

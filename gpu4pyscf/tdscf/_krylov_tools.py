@@ -17,7 +17,11 @@ import sys
 import scipy.linalg
 
 from gpu4pyscf.tdscf import math_helper
-from gpu4pyscf.lib import logger, cusolver
+from gpu4pyscf.lib import logger
+if not cp.cuda.runtime.is_hip:
+    from gpu4pyscf.lib import cusolver
+else:
+    from gpu4pyscf.lib import rocsolver as cusolver
 from functools import partial
 from pyscf.data.nist import HARTREE2EV
 

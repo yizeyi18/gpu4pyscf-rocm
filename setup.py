@@ -18,6 +18,8 @@ import sys
 import subprocess
 import re
 import glob
+import shlex
+from typing import Optional
 
 from setuptools import setup, find_packages
 from setuptools.command.build_py import build_py
@@ -34,14 +36,70 @@ CLASSIFIERS = None
 PLATFORMS = None
 
 def get_cuda_version():
-    nvcc_out = subprocess.check_output(["nvcc", "--version"]).decode('utf-8')
+    nvcc = os.environ.get('NVCC', 'nvcc')
+    nvcc_out = subprocess.check_output([nvcc, "--version"], stderr=subprocess.STDOUT).decode('utf-8')
     m = re.search(r"V[0-9]+.[0-9]+", nvcc_out)
+    if not m:
+        raise RuntimeError("Unable to parse CUDA version from nvcc --version output")
     str_version = m.group(0)[1:]
     major_version, minor_version = str_version.split('.')[:2]
     if major_version == '12' and int(minor_version) < 4:
         # code compiled by 12.4+ may not run on 12.1-12.3
         return major_version + '1'
     return major_version + 'x'
+
+
+def get_hip_version():
+    hipcc = os.environ.get('HIPCC', 'hipcc')
+    try:
+        hipcc_out = subprocess.check_output([hipcc, "--version"], stderr=subprocess.STDOUT).decode('utf-8')
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    patterns = [
+        r"HIP version\s*:?\s*([0-9]+(?:\.[0-9]+)*)",
+        r"hipcc version\s*:?\s*([0-9]+(?:\.[0-9]+)*)",
+        r"HCC clang version\s*:?\s*([0-9]+(?:\.[0-9]+)*)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, hipcc_out)
+        if m:
+            return m.group(1)
+    return None
+
+
+def normalize_backend(value: str) -> str:
+    mapping = {
+        'cuda': 'CUDA',
+        'nvidia': 'CUDA',
+        'hip': 'HIP',
+        'rocm': 'HIP',
+        'amd': 'HIP',
+    }
+    key = value.lower()
+    if key not in mapping:
+        raise ValueError(
+            f"Unsupported GPU backend '{value}'. Supported values are: CUDA or HIP"
+        )
+    return mapping[key]
+
+
+def detect_gpu_backend() -> str:
+    backend = os.environ.get('GPU4PYSCF_GPU_BACKEND')
+    if backend is None:
+        backend = os.environ.get('GPU4PYSCF_BACKEND')
+    if backend is None and get_hip_version() is not None:
+        backend = 'HIP'
+    else:
+        backend = 'CUDA'
+    return normalize_backend(backend)
+
+
+def backend_specific_dependency(env_key: str, default: Optional[str]) -> Optional[str]:
+    value = os.environ.get(env_key)
+    if value is None:
+        return default
+    value = value.strip()
+    return value or None
 
 def get_version():
     topdir = os.path.abspath(os.path.join(__file__, '..'))
@@ -58,6 +116,27 @@ def get_version():
 
 
 VERSION = get_version()
+GPU_BACKEND = detect_gpu_backend()
+IS_SDIST = 'sdist' in sys.argv
+
+if GPU_BACKEND == 'CUDA':
+    if IS_SDIST:
+        CUDA_VERSION = os.environ.get('GPU4PYSCF_CUDA_VERSION', '12x')
+    else:
+        CUDA_VERSION = os.environ.get('GPU4PYSCF_CUDA_VERSION') or get_cuda_version()
+    HIP_VERSION = None
+else:
+    CUDA_VERSION = None
+    if IS_SDIST:
+        HIP_VERSION = os.environ.get('GPU4PYSCF_HIP_VERSION')
+    else:
+        HIP_VERSION = os.environ.get('GPU4PYSCF_HIP_VERSION') or get_hip_version()
+
+def hip_version_suffix() -> str:
+    if not HIP_VERSION:
+        fallback = os.environ.get('GPU4PYSCF_HIP_VERSION_TAG', 'rocm')
+        return fallback
+    return HIP_VERSION.replace('.', '')
 
 
 class CMakeBuildPy(build_py):
@@ -70,17 +149,33 @@ class CMakeBuildPy(build_py):
         self.announce('Configuring extensions', level=3)
         src_dir = os.path.abspath(os.path.join(__file__, '..', 'gpu4pyscf', 'lib'))
         dest_dir = os.path.join(self.build_temp, 'gpu4pyscf')
-        cmd = ['cmake', f'-S{src_dir}', f'-B{dest_dir}', '-DBUILD_LIBXC=OFF']
+        cmd = [
+            'cmake',
+            f'-S{src_dir}',
+            f'-B{dest_dir}',
+            '-DBUILD_LIBXC=OFF',
+            f'-DGPU4PYSCF_GPU_BACKEND={GPU_BACKEND}',
+        ]
+        if GPU_BACKEND == 'CUDA':
+            cuda_arch = os.environ.get('GPU4PYSCF_CUDA_ARCHITECTURES')
+            if cuda_arch:
+                cmd.append(f'-DCMAKE_CUDA_ARCHITECTURES={cuda_arch}')
+        elif GPU_BACKEND == 'HIP':
+            hip_arch = os.environ.get('GPU4PYSCF_HIP_ARCHITECTURES')
+            if hip_arch:
+                cmd.append(f'-DCMAKE_HIP_ARCHITECTURES={hip_arch}')
+            cmd.append('-DBUILD_CUTLASS=OFF')
+            cmd.append('-DCMAKE_HIP_FLAGS=-Wno-unused-result')
         configure_args = os.getenv('CMAKE_CONFIGURE_ARGS')
         if configure_args:
-            cmd.extend(configure_args.split(' '))
+            cmd.extend(shlex.split(configure_args))
         self.spawn(cmd)
 
         self.announce('Building binaries', level=3)
         cmd = ['cmake', '--build', dest_dir, '-j', '8']
         build_args = os.getenv('CMAKE_BUILD_ARGS')
         if build_args:
-            cmd.extend(build_args.split(' '))
+            cmd.extend(shlex.split(build_args))
         if self.dry_run:
             self.announce(' '.join(cmd))
         else:
@@ -111,13 +206,49 @@ try:
 except ImportError:
     pass
 
-if 'sdist' in sys.argv:
-    # The sdist release
+if IS_SDIST:
     package_name = NAME
-    CUDA_VERSION = '12x'
 else:
-    CUDA_VERSION = get_cuda_version()
-    package_name = NAME + '-cuda' + CUDA_VERSION
+    if GPU_BACKEND == 'CUDA':
+        package_name = NAME + '-cuda' + CUDA_VERSION
+    else:
+        package_name = NAME + '-hip' + hip_version_suffix()
+
+base_requires = [
+    'pyscf>=2.8.0',
+    'pyscf-dispersion',
+    'geometric',
+    'packaging',
+]
+
+backend_requires = []
+
+if GPU_BACKEND == 'CUDA':
+    cupy_pkg = backend_specific_dependency(
+        'GPU4PYSCF_CUDA_CUPY_PKG',
+        f'cupy-cuda{CUDA_VERSION}>=13.0,!=13.4.0', # Due to expm in cupyx.scipy.linalg and cutensor 2.0
+    )
+    libxc_pkg = backend_specific_dependency(
+        'GPU4PYSCF_CUDA_LIBXC_PKG',
+        f'gpu4pyscf-libxc-cuda{CUDA_VERSION}==0.8.1',
+    )
+    for pkg in (cupy_pkg, libxc_pkg):
+        if pkg:
+            backend_requires.append(pkg)
+elif GPU_BACKEND == 'HIP':
+    cupy_pkg = backend_specific_dependency(
+        'GPU4PYSCF_HIP_CUPY_PKG',
+        os.environ.get('GPU4PYSCF_DEFAULT_HIP_CUPY', 'cupy>=13.0'),
+    )
+    libxc_pkg = backend_specific_dependency(
+        'GPU4PYSCF_HIP_LIBXC_PKG',
+        os.environ.get('GPU4PYSCF_DEFAULT_HIP_LIBXC', ''),
+    )
+    for pkg in (cupy_pkg, libxc_pkg):
+        if pkg:
+            backend_requires.append(pkg)
+
+install_requires = base_requires + backend_requires
 
 setup(
     name=package_name,
@@ -138,12 +269,5 @@ setup(
         "pytest-coverage==0.0",
     ],
     cmdclass={'build_py': CMakeBuildPy},
-    install_requires=[
-        'pyscf>=2.8.0',
-        'pyscf-dispersion',
-        f'cupy-cuda{CUDA_VERSION}>=13.0,!=13.4.0', # Due to expm in cupyx.scipy.linalg and cutensor 2.0
-        'geometric',
-        f'gpu4pyscf-libxc-cuda{CUDA_VERSION}==0.8.1',
-        'packaging',
-    ]
+    install_requires=install_requires
 )

@@ -25,7 +25,10 @@ from pyscf.gto import mole
 from pyscf.data import nist
 from pyscf.x2c import x2c as x2c_cpu
 from gpu4pyscf.lib.cupy_helper import block_diag, asarray, hermi_triu
-from gpu4pyscf.lib.cusolver import eigh
+if not cp.cuda.runtime.is_hip:
+    from gpu4pyscf.lib.cusolver import eigh
+else:
+    from gpu4pyscf.lib.rocsolver import eigh
 from gpu4pyscf.lib import logger
 from gpu4pyscf.scf import hf, ghf
 from gpu4pyscf.gto.mole import SortedGTO

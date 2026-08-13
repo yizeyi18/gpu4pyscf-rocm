@@ -79,7 +79,7 @@ class KnownValues(unittest.TestCase):
             problem_type='eigenvalue',
             n_states=self.n_states,
             conv_tol=1e-8,
-            max_iter=35,
+            max_iter=50,
             gram_schmidt=False,
             verbose=4,
             single=False

@@ -1,0 +1,596 @@
+#include "hip/hip_runtime.h"
+/*
+ * Copyright 2025 The PySCF Developers. All Rights Reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_runtime.h>
+#include "gint/cuda_alloc.h"
+#include "vhf.h"
+#include "rys_roots.hip"
+#include "rys_contract_k.h"
+#include "create_tasks.hip"
+#include "build_rys_gxyz.h"
+
+#define THREADS         256
+#define BLOCK_SIZE      16
+#define NF_AUX_MAX      28
+#define AUX_CACHE_SIZE  30
+#define IJ_WIDTH        36
+#define DM_BATCH_SIZE   4
+
+template <int NF, int N_DM> __device__ __forceinline__
+void _dot_dm(double *vj_xyz, double *gout, double *dm, int n_dm, size_t nao2)
+{
+#pragma unroll
+    for (int m = 0; m < N_DM; ++m) {
+        if (m >= n_dm) break;
+        double dm_ij = dm[m*nao2];
+#pragma unroll
+        for (int k = 0; k < NF; k++) {
+            vj_xyz[m*NF+k] += gout[k] * dm_ij;
+        }
+    }
+}
+
+template <int NF, int N_DM> __device__ __forceinline__
+void _store_vj_aux(double *out, double *vj_xyz, int n_dm, int naux)
+{
+#pragma unroll
+    for (uint32_t m = 0; m < N_DM; ++m) {
+        if (m >= n_dm) break;
+#pragma unroll
+        for (uint32_t k = 0; k < NF; k++) {
+            atomicAdd(out+m*naux+k, vj_xyz[m*NF+k]);
+        }
+    }
+}
+
+template <int NF_IJ, int N_DM> __device__ __forceinline__
+void _dot_aux(double *vj, double *gx, double *vj_aux,
+              int *idx_i, int *idx_j, int *idx_k, int li, int lj, int lk,
+              int gout_stride, int gout_id)
+{
+    int nfi = c_nf[li];
+    int nfj = c_nf[lj];
+    int nfk = c_nf[lk];
+    int nfij = nfi * nfj;
+    float div_nfi = c_div_nf[li];
+#pragma unroll
+    for (int n = 0; n < NF_IJ; ++n) {
+        int ij = gout_id + n * gout_stride;
+        if (ij >= nfij) break;
+        int j = ij * div_nfi;
+        int i = ij - nfi * j;
+        int addrx = idx_i[i*3+0] + idx_j[j*3+0];
+        int addry = idx_i[i*3+1] + idx_j[j*3+1];
+        int addrz = idx_i[i*3+2] + idx_j[j*3+2];
+        for (int k = 0; k < nfk; ++k) {
+            double Ix = gx[addrx + idx_k[k*3+0]];
+            double Iy = gx[addry + idx_k[k*3+1]];
+            double Iz = gx[addrz + idx_k[k*3+2]];
+            double gout = Ix * Iy * Iz;
+#pragma unroll
+            for (int m = 0; m < N_DM; ++m) {
+                vj[n*N_DM+m] += gout * vj_aux[m*nfk+k];
+            }
+        }
+    }
+}
+
+template <int NF_IJ, int N_DM> __device__ __forceinline__
+void _store_vj(double *out, double *vj_cache, int li, int lj, size_t nao,
+               int gout_stride, int gout_id)
+{
+    size_t nao2 = nao * nao;
+    int nfi = c_nf[li];
+    int nfj = c_nf[lj];
+    int nfij = nfi * nfj;
+    float div_nfi = c_div_nf[li];
+#pragma unroll
+    for (int n = 0; n < NF_IJ; ++n) {
+        int ij = gout_id + n * gout_stride;
+        if (ij >= nfij) break;
+        int j = ij * div_nfi;
+        int i = ij - nfi * j;
+#pragma unroll
+        for (int m = 0; m < N_DM; ++m) {
+            atomicAdd(out + m*nao2 + i*nao+j, vj_cache[n*N_DM+m]);
+        }
+    }
+}
+
+__global__ static
+void contract_int3c2e_dm_kernel(double *out, double *dm, int n_dm, int naux,
+                                RysIntEnvVars envs, int *shl_pair_offsets,
+                                uint32_t *bas_ij_idx, int *gout_stride_lookup)
+{
+    int thread_id = threadIdx.x;
+    int nbas = envs.nbas;
+    int ksh = blockIdx.x + nbas;
+    int *bas = envs.bas;
+    int *ao_loc = envs.ao_loc;
+    double *env = envs.env;
+    double omega = env[PTR_RANGE_OMEGA];
+    extern __shared__ double shared_memory[];
+    __shared__ int shl_pair0, shl_pair1;
+    __shared__ int li, lj, lk, nroots;
+    __shared__ int iprim, jprim, kprim;
+    __shared__ int g_size;
+    __shared__ int gout_stride, nst_per_block;
+    __shared__ int dm_id0;
+    __shared__ double xk, yk, zk;
+    __shared__ int expk, ck;
+    if (thread_id == 0) {
+        int sp_block_id = gridDim.y - blockIdx.y - 1;
+        shl_pair0 = shl_pair_offsets[sp_block_id];
+        shl_pair1 = shl_pair_offsets[sp_block_id+1];
+        int bas_ij0 = bas_ij_idx[shl_pair0];
+        int ish0 = bas_ij0 / nbas;
+        int jsh0 = bas_ij0 % nbas;
+        li = bas[ish0*BAS_SLOTS+ANG_OF];
+        lj = bas[jsh0*BAS_SLOTS+ANG_OF];
+        lk = bas[ksh*BAS_SLOTS+ANG_OF];
+        int lij = li + lj;
+        nroots = (lij + lk) / 2 + 1;
+        if (omega < 0) {
+            nroots *= 2;
+        }
+        iprim = bas[ish0*BAS_SLOTS+NPRIM_OF];
+        jprim = bas[jsh0*BAS_SLOTS+NPRIM_OF];
+        kprim = bas[ksh*BAS_SLOTS+NPRIM_OF];
+        int stride_j = li + 1;
+        int stride_k = stride_j * (lj + 1);
+        g_size = stride_k * (lk + 1);
+        gout_stride = gout_stride_lookup[lk*LMAX1*LMAX1+li*LMAX1+lj];
+        nst_per_block = THREADS / gout_stride;
+        dm_id0 = 0;
+    }
+    __syncthreads();
+    int gout_id = thread_id / nst_per_block;
+    int sp_id = thread_id % nst_per_block;
+
+    size_t nao = ao_loc[nbas];
+    int nfi = c_nf[li];
+    int nfj = c_nf[lj];
+    int nfk = c_nf[lk];
+    int stride_j = li + 1;
+    int stride_k = stride_j * (lj + 1);
+    int gx_len = g_size * nst_per_block;
+    double *rjri = shared_memory + sp_id;
+    double *Rpq = shared_memory + nst_per_block * 3 + sp_id;
+    double *gx = shared_memory + nst_per_block * 6 + sp_id;
+    double *rw = shared_memory + nst_per_block * (g_size*3+6) + sp_id;
+    int *idx_i = (int*)(shared_memory + nst_per_block*(g_size*3+nroots*2+6));
+    int *idx_j = idx_i + nfi * 3;
+    int *idx_k = idx_j + nfj * 3;
+    if (thread_id < nfi * 3) {
+        idx_i[thread_id] = lex_xyz_address(li, thread_id) * nst_per_block;
+        idx_i[thread_id] += (thread_id % 3) * gx_len;
+    }
+    if (thread_id < nfj * 3) {
+        idx_j[thread_id] = lex_xyz_address(lj, thread_id) * stride_j * nst_per_block;
+    }
+    if (thread_id < nfk * 3) {
+        idx_k[thread_id] = lex_xyz_address(lk, thread_id) * stride_k * nst_per_block;
+    }
+
+    if (thread_id == 0) {
+        double *rk = env + bas[ksh*BAS_SLOTS+PTR_BAS_COORD];
+        xk = rk[0];
+        yk = rk[1];
+        zk = rk[2];
+        expk = bas[ksh*BAS_SLOTS+PTR_EXP];
+        ck = bas[ksh*BAS_SLOTS+PTR_COEFF];
+    }
+
+while (dm_id0 < n_dm) {
+    double gout[NF_AUX_MAX];
+    double vj_xyz[AUX_CACHE_SIZE];
+    for (int n = 0; n < AUX_CACHE_SIZE; ++n) {
+        vj_xyz[n] = 0;
+    }
+    for (int pair_ij = shl_pair0+sp_id; pair_ij < shl_pair1+sp_id; pair_ij += nst_per_block) {
+        __syncthreads();
+        int bas_ij;
+        if (pair_ij < shl_pair1) {
+            bas_ij = bas_ij_idx[pair_ij];
+        } else {
+            bas_ij = bas_ij_idx[shl_pair0];
+        }
+        int ish = bas_ij / nbas;
+        int jsh = bas_ij % nbas;
+        uint32_t i0 = ao_loc[ish];
+        uint32_t j0 = ao_loc[jsh];
+        size_t dm_off = (dm_id0 * nao + j0) * nao + i0;
+        int expi = bas[ish*BAS_SLOTS+PTR_EXP];
+        int expj = bas[jsh*BAS_SLOTS+PTR_EXP];
+        int ci = bas[ish*BAS_SLOTS+PTR_COEFF];
+        int cj = bas[jsh*BAS_SLOTS+PTR_COEFF];
+        int ri = bas[ish*BAS_SLOTS+PTR_BAS_COORD];
+        int rj = bas[jsh*BAS_SLOTS+PTR_BAS_COORD];
+        double xi = env[ri+0];
+        double yi = env[ri+1];
+        double zi = env[ri+2];
+        double xjxi = env[rj+0] - xi;
+        double yjyi = env[rj+1] - yi;
+        double zjzi = env[rj+2] - zi;
+        if (gout_id == 0) {
+            rjri[0*nst_per_block] = xjxi;
+            rjri[1*nst_per_block] = yjyi;
+            rjri[2*nst_per_block] = zjzi;
+        }
+        double fac_ij = PI_FAC;
+        if (ish == jsh) {
+            fac_ij *= .5;
+        } else if (ish < jsh) {
+            fac_ij = 0;
+        }
+        for (int ijp = 0; ijp < iprim*jprim; ++ijp) {
+            __syncthreads();
+            int ip = ijp / jprim;
+            int jp = ijp - jprim * ip;
+            double ai = env[expi+ip];
+            double aj = env[expj+jp];
+            double aij = ai + aj;
+            double aj_aij = aj / aij;
+            double xjxi = rjri[0*nst_per_block];
+            double yjyi = rjri[1*nst_per_block];
+            double zjzi = rjri[2*nst_per_block];
+            double xij = xi + xjxi * aj_aij;
+            double yij = yi + yjyi * aj_aij;
+            double zij = zi + zjzi * aj_aij;
+            double xpq = xij - xk;
+            double ypq = yij - yk;
+            double zpq = zij - zk;
+            double rr = xpq*xpq + ypq*ypq + zpq*zpq;
+            if (gout_id == 0) {
+                double theta_ij = ai * aj_aij;
+                double rr_ij = xjxi*xjxi + yjyi*yjyi + zjzi*zjzi;
+                double Kab = theta_ij * rr_ij;
+                double cicj = fac_ij * env[ci+ip] * env[cj+jp];
+                gx[0] = cicj * exp(-Kab);
+                Rpq[0*nst_per_block] = xpq;
+                Rpq[1*nst_per_block] = ypq;
+                Rpq[2*nst_per_block] = zpq;
+            }
+            for (int kp = 0; kp < kprim; ++kp) {
+                __syncthreads();
+                double ak = env[expk+kp];
+                double theta = aij * ak / (aij + ak);
+                if (gout_id == 0) {
+                    gx[gx_len] = env[ck+kp] / (aij*ak*sqrt(aij+ak));
+                }
+                rys_roots_rs(nroots, theta, rr, omega, rw, nst_per_block,
+                             gout_id, gout_stride);
+                for (int irys = 0; irys < nroots; ++irys) {
+                    int lij = li + lj;
+                    int stride_j = li + 1;
+                    int stride_k = stride_j * (lj + 1);
+                    BUILD_3C_GXYZ(lj, lk, nst_per_block, pair_ij < shl_pair1);
+                    if (pair_ij < shl_pair1) {
+                        int nfi = c_nf[li];
+                        int nfj = c_nf[lj];
+                        int nfij = nfi * nfj;
+                        float div_nfi = c_div_nf[li];
+                        for (int ij = gout_id; ij < nfij; ij += gout_stride) {
+                            uint32_t j = ij * div_nfi;
+                            uint32_t i = ij - nfi * j;
+                            int ij_addrx = idx_i[i*3+0] + idx_j[j*3+0];
+                            int ij_addry = idx_i[i*3+1] + idx_j[j*3+1];
+                            int ij_addrz = idx_i[i*3+2] + idx_j[j*3+2];
+                            double dm_ij = dm[dm_off+j*nao+i];
+#pragma unroll
+                            for (int k = 0; k < NF_AUX_MAX; ++k) {
+                                if (k >= nfk) break;
+                                int addrx = ij_addrx + idx_k[k*3+0];
+                                int addry = ij_addry + idx_k[k*3+1];
+                                int addrz = ij_addrz + idx_k[k*3+2];
+                                gout[k] = gx[addrx] * gx[addry] * gx[addrz];
+                                vj_xyz[k] += gout[k] * dm_ij;
+                            }
+                            // - 1 to exclude the first dm that has been processed above
+                            int dm_remaining = n_dm - dm_id0 - 1;
+                            // Processing contraction remaining density matrices.
+                            // No need to perform the additional contraction for
+                            // lk=5,6, as vj_xyz is only enough to hold one output.
+                            if (dm_remaining > 0) {
+                                size_t nao2 = nao * nao;
+                                double *dm_local = dm + dm_off+nao2 + j*nao+i;
+                                switch (lk) {
+                                case 0: _dot_dm<1, 9>(vj_xyz+1 , gout, dm_local, dm_remaining, nao2); break;
+                                case 1: _dot_dm<3, 9>(vj_xyz+3 , gout, dm_local, dm_remaining, nao2); break;
+                                case 2: _dot_dm<6, 4>(vj_xyz+6 , gout, dm_local, dm_remaining, nao2); break;
+                                case 3: _dot_dm<10,2>(vj_xyz+10, gout, dm_local, dm_remaining, nao2); break;
+                                case 4: _dot_dm<15,1>(vj_xyz+15, gout, dm_local, dm_remaining, nao2); break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    int k0 = ao_loc[ksh] - ao_loc[nbas];
+    double *vj = out + k0 + dm_id0 * naux;
+    int dm_remaining = n_dm - dm_id0;
+    switch (lk) {
+    case 0: _store_vj_aux<1,10>(vj, vj_xyz, dm_remaining, naux); break;
+    case 1: _store_vj_aux<3,10>(vj, vj_xyz, dm_remaining, naux); break;
+    case 2: _store_vj_aux<6, 5>(vj, vj_xyz, dm_remaining, naux); break;
+    case 3: _store_vj_aux<10,3>(vj, vj_xyz, dm_remaining, naux); break;
+    case 4: _store_vj_aux<15,2>(vj, vj_xyz, dm_remaining, naux); break;
+    case 5: _store_vj_aux<21,1>(vj, vj_xyz, dm_remaining, naux); break;
+    case 6: _store_vj_aux<28,1>(vj, vj_xyz, dm_remaining, naux); break;
+    }
+    __syncthreads();
+    if (thread_id == 0) {
+        switch (lk) {
+        case 0: dm_id0 +=10; break;
+        case 1: dm_id0 +=10; break;
+        case 2: dm_id0 += 5; break;
+        case 3: dm_id0 += 3; break;
+        case 4: dm_id0 += 2; break;
+        default: dm_id0 += 1;
+        }
+    }
+    __syncthreads();
+}
+}
+
+__global__ static
+void contract_int3c2e_auxvec_kernel(double *out, double *auxvec, int n_dm, int naux,
+                                    RysIntEnvVars envs, int *shl_pair_offsets,
+                                    uint32_t *bas_ij_idx, int *ksh_offsets,
+                                    int *gout_stride_lookup)
+{
+    // For better load balance, consume blocks in the reversed order
+    int thread_id = threadIdx.x;
+    int nbas = envs.nbas;
+    int *bas = envs.bas;
+    double *env = envs.env;
+    extern __shared__ double shared_memory[];
+    __shared__ int shl_pair0, shl_pair1;
+    __shared__ int ksh0, ksh1;
+    __shared__ int li, lj, lk, nroots;
+    __shared__ int iprim, jprim, kprim;
+    __shared__ int gout_stride, nst_per_block;
+    double omega = env[PTR_RANGE_OMEGA];
+    if (thread_id == 0) {
+        int sp_block_id = gridDim.x - blockIdx.x - 1;
+        int ksh_block_id = gridDim.y - blockIdx.y - 1;
+        ksh0 = ksh_offsets[ksh_block_id];
+        ksh1 = ksh_offsets[ksh_block_id+1];
+        shl_pair0 = shl_pair_offsets[sp_block_id];
+        shl_pair1 = shl_pair_offsets[sp_block_id+1];
+        int bas_ij0 = bas_ij_idx[shl_pair0];
+        int ish0 = bas_ij0 / nbas;
+        int jsh0 = bas_ij0 % nbas;
+        li = bas[ish0*BAS_SLOTS+ANG_OF];
+        lj = bas[jsh0*BAS_SLOTS+ANG_OF];
+        lk = bas[ksh0*BAS_SLOTS+ANG_OF];
+        int lij = li + lj;
+        nroots = (lij + lk) / 2 + 1;
+        if (omega < 0) {
+            nroots *= 2;
+        }
+        iprim = bas[ish0*BAS_SLOTS+NPRIM_OF];
+        jprim = bas[jsh0*BAS_SLOTS+NPRIM_OF];
+        kprim = bas[ksh0*BAS_SLOTS+NPRIM_OF];
+        gout_stride = gout_stride_lookup[lk*LMAX1*LMAX1+li*LMAX1+lj];
+        nst_per_block = THREADS / gout_stride;
+    }
+    __syncthreads();
+    int gout_id = thread_id / nst_per_block;
+    int sp_id = thread_id % nst_per_block;
+
+    int nfi = c_nf[li];
+    int nfj = c_nf[lj];
+    int nfk = c_nf[lk];
+    int stride_j = li + 1;
+    int stride_k = stride_j * (lj + 1);
+    int g_size = stride_k * (lk + 1);
+    int gx_len = g_size * nst_per_block;
+    double *rjri = shared_memory + sp_id;
+    double *Rpq = shared_memory + nst_per_block * 3 + sp_id;
+    double *gx = shared_memory + nst_per_block * 6 + sp_id;
+    double *rw = shared_memory + nst_per_block * (g_size*3+6) + sp_id;
+    int shm_offset = nst_per_block*(g_size*3+nroots*2+6);
+    double *vj_aux = shared_memory + shm_offset;
+    int *idx_i = (int*)(shared_memory + shm_offset + DM_BATCH_SIZE*nfk);
+    int *idx_j = idx_i + nfi * 3;
+    int *idx_k = idx_j + nfj * 3;
+    if (thread_id < nfi * 3) {
+        idx_i[thread_id] = lex_xyz_address(li, thread_id) * nst_per_block;
+        idx_i[thread_id] += (thread_id % 3) * gx_len;
+    }
+    if (thread_id < nfj * 3) {
+        idx_j[thread_id] = lex_xyz_address(lj, thread_id) * stride_j * nst_per_block;
+    }
+    if (thread_id < nfk * 3) {
+        idx_k[thread_id] = lex_xyz_address(lk, thread_id) * stride_k * nst_per_block;
+    }
+
+    for (int pair_ij = shl_pair0+sp_id; pair_ij < shl_pair1+sp_id; pair_ij += nst_per_block) {
+        __syncthreads();
+        int bas_ij;
+        if (pair_ij < shl_pair1) {
+            bas_ij = bas_ij_idx[pair_ij];
+        } else {
+            bas_ij = bas_ij_idx[shl_pair0];;
+        }
+        int ish = bas_ij / nbas;
+        int jsh = bas_ij % nbas;
+        double *ri = env + bas[ish*BAS_SLOTS+PTR_BAS_COORD];
+        double *rj = env + bas[jsh*BAS_SLOTS+PTR_BAS_COORD];
+        double xi = ri[0];
+        double yi = ri[1];
+        double zi = ri[2];
+        double xjxi = rj[0] - xi;
+        double yjyi = rj[1] - yi;
+        double zjzi = rj[2] - zi;
+        if (gout_id == 0) {
+            rjri[0*nst_per_block] = xjxi;
+            rjri[1*nst_per_block] = yjyi;
+            rjri[2*nst_per_block] = zjzi;
+        }
+
+        int nfij = c_nf[li] * c_nf[lj];
+        int dm_batch_size = min(DM_BATCH_SIZE, IJ_WIDTH*gout_stride / nfij);
+        for (int dm_id0 = 0; dm_id0 < n_dm; dm_id0 += dm_batch_size) {
+            dm_batch_size = min(dm_batch_size, n_dm - dm_id0);
+            if (dm_batch_size == 3) {
+                // only supports dm_batch_size = 1,2,4
+                dm_batch_size = 2;
+            }
+
+            double vj_cache[IJ_WIDTH];
+#pragma unroll
+            for (int n = 0; n < IJ_WIDTH; ++n) { vj_cache[n] = 0; }
+
+            for (int ijp = 0; ijp < iprim*jprim; ++ijp) {
+                double *expi = env + bas[ish*BAS_SLOTS+PTR_EXP];
+                double *expj = env + bas[jsh*BAS_SLOTS+PTR_EXP];
+                double *ci = env + bas[ish*BAS_SLOTS+PTR_COEFF];
+                double *cj = env + bas[jsh*BAS_SLOTS+PTR_COEFF];
+                int ip = ijp / jprim;
+                int jp = ijp % jprim;
+                double ai = expi[ip];
+                double aj = expj[jp];
+                double aij = ai + aj;
+                double aj_aij = aj / aij;
+                __syncthreads();
+                if (gout_id == 0) {
+                    double theta_ij = ai * aj_aij;
+                    double xjxi = rjri[0*nst_per_block];
+                    double yjyi = rjri[1*nst_per_block];
+                    double zjzi = rjri[2*nst_per_block];
+                    double rr_ij = xjxi*xjxi + yjyi*yjyi + zjzi*zjzi;
+                    double Kab = exp(-theta_ij * rr_ij);
+                    double cicj = ci[ip] * cj[jp] * Kab;
+                    if (pair_ij >= shl_pair1) {
+                        cicj = 0;
+                    }
+                    gx[0] = PI_FAC * cicj;
+                }
+
+                for (int ksh = ksh0; ksh < ksh1; ++ksh) {
+                    double *expk = env + bas[ksh*BAS_SLOTS+PTR_EXP];
+                    double *ck = env + bas[ksh*BAS_SLOTS+PTR_COEFF];
+                    double *rk = env + bas[ksh*BAS_SLOTS+PTR_BAS_COORD];
+                    int *ao_loc = envs.ao_loc;
+                    int k0 = ao_loc[ksh] - ao_loc[nbas];
+                    __syncthreads();
+                    if (thread_id < dm_batch_size*nfk) {
+                        int n = thread_id * c_div_nf[lk];
+                        int k = thread_id - nfk * n + k0;
+                        vj_aux[thread_id] = auxvec[(dm_id0+n)*naux + k];
+                    }
+                    double xij = xi + rjri[0*nst_per_block] * aj_aij;
+                    double yij = yi + rjri[1*nst_per_block] * aj_aij;
+                    double zij = zi + rjri[2*nst_per_block] * aj_aij;
+                    double xpq = xij - rk[0];
+                    double ypq = yij - rk[1];
+                    double zpq = zij - rk[2];
+                    double rr = xpq*xpq + ypq*ypq + zpq*zpq;
+                    if (gout_id == 0) {
+                        Rpq[0*nst_per_block] = xpq;
+                        Rpq[1*nst_per_block] = ypq;
+                        Rpq[2*nst_per_block] = zpq;
+                    }
+                    for (int kp = 0; kp < kprim; ++kp) {
+                        __syncthreads();
+                        double ak = expk[kp];
+                        double theta = aij * ak / (aij + ak);
+                        if (gout_id == 0) {
+                            gx[gx_len] = ck[kp] / (aij*ak*sqrt(aij+ak));
+                        }
+                        rys_roots_rs(nroots, theta, rr, omega, rw, nst_per_block,
+                                     gout_id, gout_stride);
+                        for (int irys = 0; irys < nroots; ++irys) {
+                            int lij = li + lj;
+                            BUILD_3C_GXYZ(lj, lk, nst_per_block, pair_ij < shl_pair1);
+                            if (pair_ij < shl_pair1) {
+                                switch (dm_batch_size) {
+                                case 1: _dot_aux<IJ_WIDTH, 1>(vj_cache, gx, vj_aux, idx_i, idx_j,
+                                        idx_k, li, lj, lk, gout_stride, gout_id); break;
+                                case 2: _dot_aux<18, 2>(vj_cache, gx, vj_aux, idx_i, idx_j,
+                                        idx_k, li, lj, lk, gout_stride, gout_id); break;
+                                case 4: _dot_aux<9, 4>(vj_cache, gx, vj_aux, idx_i, idx_j,
+                                        idx_k, li, lj, lk, gout_stride, gout_id); break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (pair_ij < shl_pair1) {
+                int *ao_loc = envs.ao_loc;
+                size_t nao = ao_loc[nbas];
+                int i0 = ao_loc[ish];
+                int j0 = ao_loc[jsh];
+                double *vj = out + (dm_id0 * nao + i0) * nao + j0;
+                switch (dm_batch_size) {
+                case 1: _store_vj<IJ_WIDTH, 1>(vj, vj_cache, li, lj, nao, gout_stride, gout_id); break;
+                case 2: _store_vj<18, 2>(vj, vj_cache, li, lj, nao, gout_stride, gout_id); break;
+                case 4: _store_vj<9, 4>(vj, vj_cache, li, lj, nao, gout_stride, gout_id); break;
+                }
+            }
+        }
+    }
+}
+
+extern "C" {
+int contract_int3c2e_dm(double *out, double *dm, int n_dm, int naux,
+                        RysIntEnvVars *envs, int shm_size,
+                        int nbas_aux, int nbatches_shl_pair, int *shl_pair_offsets,
+                        uint32_t *bas_ij_idx, int *gout_stride_lookup)
+{
+    hipFuncSetAttribute(reinterpret_cast<const void*>(contract_int3c2e_dm_kernel), hipFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    dim3 blocks(nbas_aux, nbatches_shl_pair);
+    contract_int3c2e_dm_kernel<<<blocks, THREADS, shm_size>>>(
+            out, dm, n_dm, naux, *envs, shl_pair_offsets, bas_ij_idx, gout_stride_lookup);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "CUDA Error in contract_int3c2e_dm: %s\n", hipGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+// contract('ijP,P->ij', int3c2e, auxvec)
+int contract_int3c2e_auxvec(double *vj, double *auxvec, int n_dm, int naux,
+                            RysIntEnvVars *envs, int shm_size,
+                            int nbatches_shl_pair, int nbatches_ksh,
+                            int *shl_pair_offsets, int *ksh_offsets,
+                            uint32_t *bas_ij_idx, int *gout_stride_lookup)
+{
+    hipFuncSetAttribute(reinterpret_cast<const void*>(contract_int3c2e_auxvec_kernel), hipFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    dim3 blocks(nbatches_shl_pair, nbatches_ksh);
+    contract_int3c2e_auxvec_kernel<<<blocks, THREADS, shm_size>>>(
+            vj, auxvec, n_dm, naux, *envs, shl_pair_offsets, bas_ij_idx, ksh_offsets,
+            gout_stride_lookup);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "CUDA Error in contract_int3c2e_auxvec, error message = %s\n", hipGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+}

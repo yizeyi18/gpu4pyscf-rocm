@@ -1,0 +1,1162 @@
+#include "hip/hip_runtime.h"
+/*
+ * Copyright 2024-2026 The PySCF Developers. All Rights Reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_runtime.h>
+#include <hipcub/hipcub.hpp>
+#include "gvhf-rys/rys_roots.hip"
+#include "gvhf-rys/rys_contract_k.h"
+#include "gvhf-rys/build_rys_gxyz.h"
+#include "int3c2e_create_tasks.h"
+#include "unrolled_int3c2e.hip"
+
+#define REMOTE_THRESHOLD 50
+#define GOUT_WIDTH      54
+
+// lattice sum over j and k for (ij|k)
+__global__ static
+void pbc_int3c2e_latsum23_kernel(double *out, PBCIntEnvVars envs, uint32_t *img_pool,
+                                 ShellTripletTaskInfo *task_pool, double *c2s_pool, int shm_size,
+                                 uint32_t *bas_ij_idx, int *shl_pair_offsets, int *ksh_offsets,
+                                 int *img_idx, uint32_t *sp_img_offsets,
+                                 int *gout_stride_lookup, int *ao_pair_loc,
+                                 int ao_pair_offset, int aux_offset,
+                                 int nauxbas, int naux, int to_sph,
+                                 float *diffuse_exps, float *diffuse_coefs, float log_cutoff,
+                                 int *head, int nbatches_shl_pair, int nbatches_ksh)
+{
+    int thread_id = threadIdx.x;
+    int worker_id = blockIdx.x;
+    c2s_pool += worker_id * (THREADS*GOUT_WIDTH);
+    img_pool += worker_id * POOL_SIZE * (MAX_IMGS_PER_TASK+2);
+    // rem_task_idx stores the Id of the ijk tasks which has remaining_imgs > 0
+    uint32_t *rem_task_idx = img_pool + POOL_SIZE * MAX_IMGS_PER_TASK;
+    uint32_t *sub_task_idx = img_pool + POOL_SIZE *(MAX_IMGS_PER_TASK+1);
+    ShellTripletTaskInfo *ijk_tasks_info = task_pool + worker_id * POOL_SIZE;
+    extern __shared__ double shared_memory[];
+    __shared__ int ksh0_cell0, ksh1_cell0;
+    __shared__ int shl_pair0, shl_pair1;
+    __shared__ int li, lj, lk, nroots, nf;
+    __shared__ int iprim, jprim, kprim;
+    __shared__ int g_size, gout_stride, nst_per_block;
+    __shared__ int num_ijk_tasks;
+    __shared__ int num_sub_tasks, img_not_processed, img_tile_size;
+    __shared__ int sp_block_id, ksh_block_id;
+while (1) {
+    if (thread_id == 0) {
+        int batch_id = atomicAdd(head, 1);
+        sp_block_id = nbatches_shl_pair - 1 - batch_id / nbatches_ksh;
+        ksh_block_id = nbatches_ksh - 1 - batch_id % nbatches_ksh;
+    }
+    __syncthreads();
+    if (sp_block_id < 0) {
+        return;
+    }
+
+    int ncells = envs.bvk_ncells;
+    int *bas = envs.bas;
+    double *env = envs.env;
+    double *img_coords = envs.img_coords;
+    int nimgs = envs.nimgs;
+    if (thread_id == 0) {
+        int bvk_nbas = envs.nbas * ncells;
+        shl_pair0 = shl_pair_offsets[sp_block_id];
+        shl_pair1 = shl_pair_offsets[sp_block_id+1];
+        ksh0_cell0 = ksh_offsets[ksh_block_id];
+        ksh1_cell0 = ksh_offsets[ksh_block_id+1];
+        uint32_t bas_ij = bas_ij_idx[shl_pair0];
+        int ish = bas_ij / bvk_nbas;
+        int jsh = bas_ij - bvk_nbas * ish;
+        int ksh = bvk_nbas + ksh0_cell0;
+        li = bas[ish*BAS_SLOTS+ANG_OF];
+        lj = bas[jsh*BAS_SLOTS+ANG_OF];
+        lk = bas[ksh*BAS_SLOTS+ANG_OF];
+        int lij = li + lj;
+        nroots = ((lij + lk) / 2 + 1) * 2;
+        iprim = bas[ish*BAS_SLOTS+NPRIM_OF];
+        jprim = bas[jsh*BAS_SLOTS+NPRIM_OF];
+        kprim = bas[ksh*BAS_SLOTS+NPRIM_OF];
+        int nfi = c_nf[li];
+        int nfj = c_nf[lj];
+        int nfk = c_nf[lk];
+        int nfij = nfi * nfj;
+        nf = nfij * nfk;
+        int stride_j = li + 1;
+        int stride_k = stride_j * (lj + 1);
+        g_size = stride_k * (lk + 1);
+        gout_stride = gout_stride_lookup[lk*LMAX1*LMAX1+li*LMAX1+lj];
+        nst_per_block = THREADS / gout_stride;
+    }
+    __syncthreads();
+
+    int nfi = c_nf[li];
+    int nfj = c_nf[lj];
+    int nfk = c_nf[lk];
+    int *idx_i = (int*)shared_memory + shm_size/4 - (nfi+nfj+nfk)*3;
+    int *idx_j = idx_i + nfi * 3;
+    int *idx_k = idx_j + nfj * 3;
+    int stride_j = li + 1;
+    int stride_k = stride_j * (lj + 1);
+    int gx_len = g_size * nst_per_block;
+    if (thread_id < nfi * 3) {
+        idx_i[thread_id] = lex_xyz_address(li, thread_id) * nst_per_block;
+        idx_i[thread_id] += (thread_id % 3) * gx_len;
+    }
+    if (thread_id < nfj * 3) {
+        idx_j[thread_id] = lex_xyz_address(lj, thread_id) * stride_j * nst_per_block;
+    }
+    if (thread_id < nfk * 3) {
+        idx_k[thread_id] = lex_xyz_address(lk, thread_id) * stride_k * nst_per_block;
+    }
+
+    if (thread_id == 0) {
+        int nshl_pairs = shl_pair1 - shl_pair0;
+        int nksh = ksh1_cell0 - ksh0_cell0;
+        num_ijk_tasks = nksh * ncells * nshl_pairs;
+    }
+    __syncthreads();
+    initialize_ijk_tasks(img_pool, rem_task_idx, ijk_tasks_info, envs,
+                         shl_pair0, shl_pair1, ksh0_cell0, ksh1_cell0,
+                         li, lj, lk, nauxbas, bas_ij_idx, img_idx, sp_img_offsets,
+                         diffuse_exps, diffuse_coefs, log_cutoff);
+    while (num_ijk_tasks > 0) {
+    _filter_jk_images(img_pool, rem_task_idx, num_ijk_tasks, ijk_tasks_info,
+                      envs, img_idx);
+    if (thread_id == 0) {
+        img_tile_size = 8;
+        img_not_processed = MAX_IMGS_PER_TASK;
+    }
+    __syncthreads();
+    while (img_not_processed > 0) {
+        _select_sub_ijk(sub_task_idx, num_sub_tasks, img_not_processed, img_tile_size,
+                        rem_task_idx, num_ijk_tasks, ijk_tasks_info, (int *)shared_memory);
+        if (num_sub_tasks == 0) continue;
+        if (!int3c2e_unrolled(out, envs, img_pool, sub_task_idx, num_sub_tasks,
+                              img_tile_size, ijk_tasks_info, c2s_pool,
+                              shm_size, iprim, jprim, kprim, li, lj, lk,
+                              bas_ij_idx, ao_pair_loc, ao_pair_offset, aux_offset,
+                              nauxbas, naux, to_sph, thread_id, worker_id, shared_memory)) {
+            int gout_id = thread_id / nst_per_block;
+            int st_id = thread_id - gout_id * nst_per_block;
+            double *rjri = shared_memory + st_id;
+            double *Rpq = shared_memory + nst_per_block * 3 + st_id;
+            double *gx = shared_memory + nst_per_block * 6 + st_id;
+            double *rw = shared_memory + nst_per_block * (g_size*3+6) + st_id;
+            for (int task_id = st_id; task_id < num_sub_tasks + st_id; task_id += nst_per_block) {
+                ShellTripletTaskInfo *ijk_task = ijk_tasks_info;
+                int ijk_id = 0;
+                int img_start = 0;
+                if (task_id < num_sub_tasks) {
+                    ijk_id = sub_task_idx[task_id];
+                    ijk_task += ijk_id;
+                    img_start = ijk_task->img_count;
+                }
+                int ksh = ijk_task->ksh;
+                int pair_ij = ijk_task->pair_ij;
+                uint32_t bas_ij = bas_ij_idx[pair_ij];
+                int bvk_nbas = envs.nbas * ncells;
+                int ish = bas_ij / bvk_nbas;
+                int jsh = bas_ij - bvk_nbas * ish;
+                int expi = bas[ish*BAS_SLOTS+PTR_EXP];
+                int expj = bas[jsh*BAS_SLOTS+PTR_EXP];
+                int expk = bas[ksh*BAS_SLOTS+PTR_EXP];
+                int ci = bas[ish*BAS_SLOTS+PTR_COEFF];
+                int cj = bas[jsh*BAS_SLOTS+PTR_COEFF];
+                int ck = bas[ksh*BAS_SLOTS+PTR_COEFF];
+                int ri = bas[ish*BAS_SLOTS+PTR_BAS_COORD];
+                int rj = bas[jsh*BAS_SLOTS+PTR_BAS_COORD];
+                int rk = bas[ksh*BAS_SLOTS+PTR_BAS_COORD];
+                double gout[GOUT_WIDTH];
+#pragma unroll
+                for (int n = 0; n < GOUT_WIDTH; ++n) { gout[n] = 0; }
+
+                for (int ijp = 0; ijp < iprim*jprim; ++ijp) {
+                    int ip = ijp / jprim;
+                    int jp = ijp - jprim * ip;
+                    double ai = env[expi+ip];
+                    double aj = env[expj+jp];
+                    double aij = ai + aj;
+                    double aj_aij = aj / aij;
+                    for (int img = 0; img < img_tile_size; img++) {
+                        int img_jk = 0;
+                        if (task_id < num_sub_tasks) {
+                            img_jk = img_pool[ijk_id+POOL_SIZE*(img_start+img)];
+                        }
+                        __syncthreads();
+                        if (gout_id == 0) {
+                            int jL = img_jk / nimgs;
+                            int kL = img_jk - nimgs * jL;
+                            double xi = env[ri+0];
+                            double yi = env[ri+1];
+                            double zi = env[ri+2];
+                            double xjxi = env[rj+0] - xi;
+                            double yjyi = env[rj+1] - yi;
+                            double zjzi = env[rj+2] - zi;
+                            double xjLxi = xjxi + img_coords[jL*3+0];
+                            double yjLyi = yjyi + img_coords[jL*3+1];
+                            double zjLzi = zjzi + img_coords[jL*3+2];
+                            double fac_ij = 0;
+                            if (task_id < num_sub_tasks) {
+                                double rr_ij = xjLxi * xjLxi + yjLyi * yjLyi + zjLzi * zjLzi;
+                                double theta_ij = ai * aj_aij;
+                                double Kab = theta_ij * rr_ij;
+                                double cicj = PI_FAC * env[ci+ip] * env[cj+jp];
+                                fac_ij = exp(-Kab) * cicj;
+                            }
+                            double xij = xjLxi * aj_aij + xi;
+                            double yij = yjLyi * aj_aij + yi;
+                            double zij = zjLzi * aj_aij + zi;
+                            double xpq = xij - env[rk+0] - img_coords[kL*3+0];
+                            double ypq = yij - env[rk+1] - img_coords[kL*3+1];
+                            double zpq = zij - env[rk+2] - img_coords[kL*3+2];
+                            rjri[0*nst_per_block] = xjLxi;
+                            rjri[1*nst_per_block] = yjLyi;
+                            rjri[2*nst_per_block] = zjLzi;
+                            Rpq[0*nst_per_block] = xpq;
+                            Rpq[1*nst_per_block] = ypq;
+                            Rpq[2*nst_per_block] = zpq;
+                            int gx_len = g_size * nst_per_block;
+                            gx[gx_len] = fac_ij;
+                        }
+                        for (int kp = 0; kp < kprim; ++kp) {
+                            double ak = env[expk+kp];
+                            double theta = aij * ak / (aij + ak);
+                            __syncthreads();
+                            if (gout_id == 0) {
+                                gx[0] = env[ck+kp] / (aij*ak*sqrt(aij+ak));
+                            }
+                            double xpq = Rpq[0*nst_per_block];
+                            double ypq = Rpq[1*nst_per_block];
+                            double zpq = Rpq[2*nst_per_block];
+                            double rr = xpq*xpq + ypq*ypq + zpq*zpq;
+                            double omega = env[PTR_RANGE_OMEGA];
+                            rys_roots_rs(nroots, theta, rr, omega,
+                                         rw, nst_per_block, gout_id, gout_stride);
+                            for (int irys = 0; irys < nroots; ++irys) {
+                                int lij = li + lj;
+                                BUILD_3C_GXYZ(lj, lk, nst_per_block, task_id < num_sub_tasks);
+                                if (task_id < num_sub_tasks) {
+                                    int nfi = c_nf[li];
+                                    int nfj = c_nf[lj];
+                                    int nfk = c_nf[lk];
+                                    int *idx_j = idx_i + nfi * 3;
+                                    int *idx_k = idx_j + nfj * 3;
+                                    float div_nfi = c_div_nf[li];
+                                    float div_nfk = c_div_nf[lk];
+#pragma unroll
+                                    for (int n = 0; n < GOUT_WIDTH; ++n) {
+                                        uint32_t ijk = n*gout_stride+gout_id;
+                                        if (ijk >= nf) break;
+                                        uint32_t ij = ijk * div_nfk;
+                                        uint32_t k = ijk - nfk * ij;
+                                        uint32_t j = ij * div_nfi;
+                                        uint32_t i = ij - nfi * j;
+                                        int addrx = idx_i[i*3+0] + idx_j[j*3+0] + idx_k[k*3+0];
+                                        int addry = idx_i[i*3+1] + idx_j[j*3+1] + idx_k[k*3+1];
+                                        int addrz = idx_i[i*3+2] + idx_j[j*3+2] + idx_k[k*3+2];
+                                        gout[n] += gx[addrx] * gx[addry] * gx[addrz];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                __syncthreads();
+                int bvk_naux = naux * ncells;
+                int k_cell_id = (ksh - bvk_nbas) / nauxbas;
+                int ksh_cell0 = ksh - k_cell_id * nauxbas;
+                size_t pair_offset = ao_pair_loc[pair_ij] - ao_pair_offset;
+                int k0 = envs.ao_loc[ksh_cell0] - envs.ao_loc[bvk_nbas];
+                double *j3c = out + (pair_offset * ncells + k_cell_id) * naux + k0 - aux_offset;
+                if (!to_sph || (li <= 1 && lj <= 1)) {
+                    if (task_id < num_sub_tasks) {
+                        int nfk = c_nf[lk];
+#pragma unroll
+                        for (int n = 0; n < GOUT_WIDTH; ++n) {
+                            int ijk = n*gout_stride+gout_id;
+                            if (ijk >= nf) break;
+                            int ij = ijk / nfk;
+                            int k  = ijk - nfk * ij;
+                            j3c[ij*bvk_naux + k] += gout[n];
+                        }
+                    }
+                } else {
+                    double *inp_local;
+                    if (task_id < num_sub_tasks) {
+                        int nfi = c_nf[li];
+                        int nfj = c_nf[lj];
+                        int nfk = c_nf[lk];
+                        int i_stride = nst_per_block * nfk;
+                        if (nf * nst_per_block * 8 + (nfi+nfj+nfk)*12 < shm_size) {
+                            inp_local = shared_memory + st_id;
+                        } else {
+                            inp_local = c2s_pool + st_id;
+                        }
+#pragma unroll
+                        for (int n = 0; n < GOUT_WIDTH; ++n) {
+                            int ijk = n*gout_stride+gout_id;
+                            if (ijk >= nf) break;
+                            int ij = ijk / nfk;
+                            int k  = ijk - nfk * ij;
+                            inp_local[ij*i_stride + k*nst_per_block] = gout[n];
+                        }
+                    }
+                    __syncthreads();
+                    if (task_id < num_sub_tasks) {
+                        int nfi = c_nf[li];
+                        int nfj = c_nf[lj];
+                        int nfk = c_nf[lk];
+                        int di = li * 2 + 1;
+                        int i_stride = nst_per_block * nfk;
+                        int j_stride = bvk_naux * di;
+                        // Note each block within the compressed data in the input is transposed
+                        // for block with shape [nfi,nfj], i is accessed with smaller strides
+                        for (int k = gout_id; k < nfk; k += gout_stride) {
+                            for (int j = 0; j < nfj; j++) {
+                                double *inp = inp_local + (j * nfi * nfk + k) * nst_per_block;
+                                for (int i = 0; i < di; i++) {
+                                    double *sph_out = j3c + i * bvk_naux + k;
+                                    double s = 0;
+                                    // cart2sph for i
+                                    switch (li*li+i) {
+                                    case 0: { // l=0, m=0
+                                        s += inp[i_stride*0] * 1;
+                                    } break;
+                                    case 1: { // l=1, m=0
+                                        s += inp[i_stride*0] * 1;
+                                    } break;
+                                    case 2: { // l=1, m=1
+                                        s += inp[i_stride*1] * 1;
+                                    } break;
+                                    case 3: { // l=1, m=2
+                                        s += inp[i_stride*2] * 1;
+                                    } break;
+                                    case 4: { // l=2, m=0
+                                        s += inp[i_stride*1] * 1.092548430592079070;
+                                    } break;
+                                    case 5: { // l=2, m=1
+                                        s += inp[i_stride*4] * 1.092548430592079070;
+                                    } break;
+                                    case 6: { // l=2, m=2
+                                        s += inp[i_stride*0] * -0.315391565252520002;
+                                        s += inp[i_stride*3] * -0.315391565252520002;
+                                        s += inp[i_stride*5] * 0.630783130505040012;
+                                    } break;
+                                    case 7: { // l=2, m=3
+                                        s += inp[i_stride*2] * 1.092548430592079070;
+                                    } break;
+                                    case 8: { // l=2, m=4
+                                        s += inp[i_stride*0] * 0.546274215296039535;
+                                        s += inp[i_stride*3] * -0.546274215296039535;
+                                    } break;
+                                    case 9: { // l=3, m=0
+                                        s += inp[i_stride*1] * 1.770130769779930531;
+                                        s += inp[i_stride*6] * -0.590043589926643510;
+                                    } break;
+                                    case 10: { // l=3, m=1
+                                        s += inp[i_stride*4] * 2.890611442640554055;
+                                    } break;
+                                    case 11: { // l=3, m=2
+                                        s += inp[i_stride*1] * -0.457045799464465739;
+                                        s += inp[i_stride*6] * -0.457045799464465739;
+                                        s += inp[i_stride*8] * 1.828183197857862944;
+                                    } break;
+                                    case 12: { // l=3, m=3
+                                        s += inp[i_stride*2] * -1.119528997770346170;
+                                        s += inp[i_stride*7] * -1.119528997770346170;
+                                        s += inp[i_stride*9] * 0.746352665180230782;
+                                    } break;
+                                    case 13: { // l=3, m=4
+                                        s += inp[i_stride*0] * -0.457045799464465739;
+                                        s += inp[i_stride*3] * -0.457045799464465739;
+                                        s += inp[i_stride*5] * 1.828183197857862944;
+                                    } break;
+                                    case 14: { // l=3, m=5
+                                        s += inp[i_stride*2] * 1.445305721320277020;
+                                        s += inp[i_stride*7] * -1.445305721320277020;
+                                    } break;
+                                    case 15: { // l=3, m=6
+                                        s += inp[i_stride*0] * 0.590043589926643510;
+                                        s += inp[i_stride*3] * -1.770130769779930530;
+                                    } break;
+                                    case 16: { // l=4, m=0
+                                        s += inp[i_stride*1] * 2.503342941796704538;
+                                        s += inp[i_stride*6] * -2.503342941796704530;
+                                    } break;
+                                    case 17: { // l=4, m=1
+                                        s += inp[i_stride*4] * 5.310392309339791593;
+                                        s += inp[i_stride*11] * -1.770130769779930530;
+                                    } break;
+                                    case 18: { // l=4, m=2
+                                        s += inp[i_stride*1] * -0.946174695757560014;
+                                        s += inp[i_stride*6] * -0.946174695757560014;
+                                        s += inp[i_stride*8] * 5.677048174545360108;
+                                    } break;
+                                    case 19: { // l=4, m=3
+                                        s += inp[i_stride*4] * -2.007139630671867500;
+                                        s += inp[i_stride*11] * -2.007139630671867500;
+                                        s += inp[i_stride*13] * 2.676186174229156671;
+                                    } break;
+                                    case 20: { // l=4, m=4
+                                        s += inp[i_stride*0] * 0.317356640745612911;
+                                        s += inp[i_stride*3] * 0.634713281491225822;
+                                        s += inp[i_stride*5] * -2.538853125964903290;
+                                        s += inp[i_stride*10] * 0.317356640745612911;
+                                        s += inp[i_stride*12] * -2.538853125964903290;
+                                        s += inp[i_stride*14] * 0.846284375321634430;
+                                    } break;
+                                    case 21: { // l=4, m=5
+                                        s += inp[i_stride*2] * -2.007139630671867500;
+                                        s += inp[i_stride*7] * -2.007139630671867500;
+                                        s += inp[i_stride*9] * 2.676186174229156671;
+                                    } break;
+                                    case 22: { // l=4, m=6
+                                        s += inp[i_stride*0] * -0.473087347878780002;
+                                        s += inp[i_stride*5] * 2.838524087272680054;
+                                        s += inp[i_stride*10] * 0.473087347878780009;
+                                        s += inp[i_stride*12] * -2.838524087272680050;
+                                    } break;
+                                    case 23: { // l=4, m=7
+                                        s += inp[i_stride*2] * 1.770130769779930531;
+                                        s += inp[i_stride*7] * -5.310392309339791590;
+                                    } break;
+                                    case 24: { // l=4, m=8
+                                        s += inp[i_stride*0] * 0.625835735449176134;
+                                        s += inp[i_stride*3] * -3.755014412695056800;
+                                        s += inp[i_stride*10] * 0.625835735449176134;
+                                    } break;
+                                    case 25: { // l=5, m=0
+                                        s += inp[i_stride*1] * 3.281910284200850514;
+                                        s += inp[i_stride*6] * -6.563820568401701020;
+                                        s += inp[i_stride*15] * 0.656382056840170102;
+                                    } break;
+                                    case 26: { // l=5, m=1
+                                        s += inp[i_stride*4] * 8.302649259524165115;
+                                        s += inp[i_stride*11] * -8.302649259524165110;
+                                    } break;
+                                    case 27: { // l=5, m=2
+                                        s += inp[i_stride*1] * -1.467714898305751160;
+                                        s += inp[i_stride*6] * -0.978476598870500779;
+                                        s += inp[i_stride*8] * 11.741719186446009300;
+                                        s += inp[i_stride*15] * 0.489238299435250387;
+                                        s += inp[i_stride*17] * -3.913906395482003100;
+                                    } break;
+                                    case 28: { // l=5, m=3
+                                        s += inp[i_stride*4] * -4.793536784973323750;
+                                        s += inp[i_stride*11] * -4.793536784973323750;
+                                        s += inp[i_stride*13] * 9.587073569946647510;
+                                    } break;
+                                    case 29: { // l=5, m=4
+                                        s += inp[i_stride*1] * 0.452946651195696921;
+                                        s += inp[i_stride*6] * 0.905893302391393842;
+                                        s += inp[i_stride*8] * -5.435359814348363050;
+                                        s += inp[i_stride*15] * 0.452946651195696921;
+                                        s += inp[i_stride*17] * -5.435359814348363050;
+                                        s += inp[i_stride*19] * 3.623573209565575370;
+                                    } break;
+                                    case 30: { // l=5, m=5
+                                        s += inp[i_stride*2] * 1.754254836801353946;
+                                        s += inp[i_stride*7] * 3.508509673602707893;
+                                        s += inp[i_stride*9] * -4.678012898136943850;
+                                        s += inp[i_stride*16] * 1.754254836801353946;
+                                        s += inp[i_stride*18] * -4.678012898136943850;
+                                        s += inp[i_stride*20] * 0.935602579627388771;
+                                    } break;
+                                    case 31: { // l=5, m=6
+                                        s += inp[i_stride*0] * 0.452946651195696921;
+                                        s += inp[i_stride*3] * 0.905893302391393842;
+                                        s += inp[i_stride*5] * -5.435359814348363050;
+                                        s += inp[i_stride*10] * 0.452946651195696921;
+                                        s += inp[i_stride*12] * -5.435359814348363050;
+                                        s += inp[i_stride*14] * 3.623573209565575370;
+                                    } break;
+                                    case 32: { // l=5, m=7
+                                        s += inp[i_stride*2] * -2.396768392486661870;
+                                        s += inp[i_stride*9] * 4.793536784973323755;
+                                        s += inp[i_stride*16] * 2.396768392486661877;
+                                        s += inp[i_stride*18] * -4.793536784973323750;
+                                    } break;
+                                    case 33: { // l=5, m=8
+                                        s += inp[i_stride*0] * -0.489238299435250389;
+                                        s += inp[i_stride*3] * 0.978476598870500775;
+                                        s += inp[i_stride*5] * 3.913906395482003101;
+                                        s += inp[i_stride*10] * 1.467714898305751163;
+                                        s += inp[i_stride*12] * -11.741719186446009300;
+                                    } break;
+                                    case 34: { // l=5, m=9
+                                        s += inp[i_stride*2] * 2.075662314881041278;
+                                        s += inp[i_stride*7] * -12.453973889286247600;
+                                        s += inp[i_stride*16] * 2.075662314881041278;
+                                    } break;
+                                    case 35: { // l=5, m=10
+                                        s += inp[i_stride*0] * 0.656382056840170102;
+                                        s += inp[i_stride*3] * -6.563820568401701020;
+                                        s += inp[i_stride*10] * 3.281910284200850514;
+                                    } break;
+                                    case 36: { // l=6, m=0
+                                        s += inp[i_stride*1] * 4.0991046311514863;
+                                        s += inp[i_stride*6] * -13.6636821038382887;
+                                        s += inp[i_stride*15] * 4.0991046311514863;
+                                    } break;
+                                    case 37: { // l=6, m=1
+                                        s += inp[i_stride*4] * 11.8330958111587634;
+                                        s += inp[i_stride*11] * -23.6661916223175268;
+                                        s += inp[i_stride*22] * 2.3666191622317525;
+                                    } break;
+                                    case 38: { // l=6, m=2
+                                        s += inp[i_stride*1] * -2.0182596029148963;
+                                        s += inp[i_stride*8] * 20.1825960291489679;
+                                        s += inp[i_stride*15] * 2.0182596029148963;
+                                        s += inp[i_stride*17] * -20.1825960291489679;
+                                    } break;
+                                    case 39: { // l=6, m=3
+                                        s += inp[i_stride*4] * -8.2908473356343109;
+                                        s += inp[i_stride*11] * -5.5272315570895412;
+                                        s += inp[i_stride*13] * 22.1089262283581647;
+                                        s += inp[i_stride*22] * 2.7636157785447706;
+                                        s += inp[i_stride*24] * -7.3696420761193888;
+                                    } break;
+                                    case 40: { // l=6, m=4
+                                        s += inp[i_stride*1] * 0.9212052595149236;
+                                        s += inp[i_stride*6] * 1.8424105190298472;
+                                        s += inp[i_stride*8] * -14.7392841522387776;
+                                        s += inp[i_stride*15] * 0.9212052595149236;
+                                        s += inp[i_stride*17] * -14.7392841522387776;
+                                        s += inp[i_stride*19] * 14.7392841522387776;
+                                    } break;
+                                    case 41: { // l=6, m=5
+                                        s += inp[i_stride*4] * 2.9131068125936568;
+                                        s += inp[i_stride*11] * 5.8262136251873136;
+                                        s += inp[i_stride*13] * -11.6524272503746271;
+                                        s += inp[i_stride*22] * 2.9131068125936568;
+                                        s += inp[i_stride*24] * -11.6524272503746271;
+                                        s += inp[i_stride*26] * 4.6609709001498505;
+                                    } break;
+                                    case 42: { // l=6, m=6
+                                        s += inp[i_stride*0] * -0.3178460113381421;
+                                        s += inp[i_stride*3] * -0.9535380340144264;
+                                        s += inp[i_stride*5] * 5.7212282040865583;
+                                        s += inp[i_stride*10] * -0.9535380340144264;
+                                        s += inp[i_stride*12] * 11.4424564081731166;
+                                        s += inp[i_stride*14] * -7.6283042721154111;
+                                        s += inp[i_stride*21] * -0.3178460113381421;
+                                        s += inp[i_stride*23] * 5.7212282040865583;
+                                        s += inp[i_stride*25] * -7.6283042721154111;
+                                        s += inp[i_stride*27] * 1.0171072362820548;
+                                    } break;
+                                    case 43: { // l=6, m=7
+                                        s += inp[i_stride*2] * 2.9131068125936568;
+                                        s += inp[i_stride*7] * 5.8262136251873136;
+                                        s += inp[i_stride*9] * -11.6524272503746271;
+                                        s += inp[i_stride*16] * 2.9131068125936568;
+                                        s += inp[i_stride*18] * -11.6524272503746271;
+                                        s += inp[i_stride*20] * 4.6609709001498505;
+                                    } break;
+                                    case 44: { // l=6, m=8
+                                        s += inp[i_stride*0] * 0.4606026297574618;
+                                        s += inp[i_stride*3] * 0.4606026297574618;
+                                        s += inp[i_stride*5] * -7.3696420761193888;
+                                        s += inp[i_stride*10] * -0.4606026297574618;
+                                        s += inp[i_stride*14] * 7.3696420761193888;
+                                        s += inp[i_stride*21] * -0.4606026297574618;
+                                        s += inp[i_stride*23] * 7.3696420761193888;
+                                        s += inp[i_stride*25] * -7.3696420761193888;
+                                    } break;
+                                    case 45: { // l=6, m=9
+                                        s += inp[i_stride*2] * -2.7636157785447706;
+                                        s += inp[i_stride*7] * 5.5272315570895412;
+                                        s += inp[i_stride*9] * 7.3696420761193888;
+                                        s += inp[i_stride*16] * 8.2908473356343109;
+                                        s += inp[i_stride*18] * -22.1089262283581647;
+                                    } break;
+                                    case 46: { // l=6, m=10
+                                        s += inp[i_stride*0] * -0.5045649007287241;
+                                        s += inp[i_stride*3] * 2.5228245036436201;
+                                        s += inp[i_stride*5] * 5.0456490072872420;
+                                        s += inp[i_stride*10] * 2.5228245036436201;
+                                        s += inp[i_stride*12] * -30.2738940437234518;
+                                        s += inp[i_stride*21] * -0.5045649007287241;
+                                        s += inp[i_stride*23] * 5.0456490072872420;
+                                    } break;
+                                    case 47: { // l=6, m=11
+                                        s += inp[i_stride*2] * 2.3666191622317525;
+                                        s += inp[i_stride*7] * -23.6661916223175268;
+                                        s += inp[i_stride*16] * 11.8330958111587634;
+                                    } break;
+                                    case 48: { // l=6, m=12
+                                        s += inp[i_stride*0] * 0.6831841051919144;
+                                        s += inp[i_stride*3] * -10.2477615778787161;
+                                        s += inp[i_stride*10] * 10.2477615778787161;
+                                        s += inp[i_stride*21] * -0.6831841051919144;
+                                    } break;
+                                    }
+                                    // cart2sph for j
+                                    switch (j+nfj*lj/3) {
+                                    case 0: { // l=0, j=0
+                                        sph_out[0*j_stride] += s * 1;
+                                    } break;
+                                    case 1: { // l=1, j=0
+                                        sph_out[0*j_stride] += s * 1;
+                                    } break;
+                                    case 2: { // l=1, j=1
+                                        sph_out[1*j_stride] += s * 1;
+                                    } break;
+                                    case 3: { // l=1, j=2
+                                        sph_out[2*j_stride] += s * 1;
+                                    } break;
+                                    case 4: { // l=2, j=0
+                                        sph_out[2*j_stride] += s * -0.315391565252520002;
+                                        sph_out[4*j_stride] += s * 0.546274215296039535;
+                                    } break;
+                                    case 5: { // l=2, j=1
+                                        sph_out[0*j_stride] += s * 1.092548430592079070;
+                                    } break;
+                                    case 6: { // l=2, j=2
+                                        sph_out[3*j_stride] += s * 1.092548430592079070;
+                                    } break;
+                                    case 7: { // l=2, j=3
+                                        sph_out[2*j_stride] += s * -0.315391565252520002;
+                                        sph_out[4*j_stride] += s * -0.546274215296039535;
+                                    } break;
+                                    case 8: { // l=2, j=4
+                                        sph_out[1*j_stride] += s * 1.092548430592079070;
+                                    } break;
+                                    case 9: { // l=2, j=5
+                                        sph_out[2*j_stride] += s * 0.630783130505040012;
+                                    } break;
+                                    case 10: { // l=3, j=0
+                                        sph_out[4*j_stride] += s * -0.457045799464465739;
+                                        sph_out[6*j_stride] += s * 0.590043589926643510;
+                                    } break;
+                                    case 11: { // l=3, j=1
+                                        sph_out[0*j_stride] += s * 1.770130769779930531;
+                                        sph_out[2*j_stride] += s * -0.457045799464465739;
+                                    } break;
+                                    case 12: { // l=3, j=2
+                                        sph_out[3*j_stride] += s * -1.119528997770346170;
+                                        sph_out[5*j_stride] += s * 1.445305721320277020;
+                                    } break;
+                                    case 13: { // l=3, j=3
+                                        sph_out[4*j_stride] += s * -0.457045799464465739;
+                                        sph_out[6*j_stride] += s * -1.770130769779930530;
+                                    } break;
+                                    case 14: { // l=3, j=4
+                                        sph_out[1*j_stride] += s * 2.890611442640554055;
+                                    } break;
+                                    case 15: { // l=3, j=5
+                                        sph_out[4*j_stride] += s * 1.828183197857862944;
+                                    } break;
+                                    case 16: { // l=3, j=6
+                                        sph_out[0*j_stride] += s * -0.590043589926643510;
+                                        sph_out[2*j_stride] += s * -0.457045799464465739;
+                                    } break;
+                                    case 17: { // l=3, j=7
+                                        sph_out[3*j_stride] += s * -1.119528997770346170;
+                                        sph_out[5*j_stride] += s * -1.445305721320277020;
+                                    } break;
+                                    case 18: { // l=3, j=8
+                                        sph_out[2*j_stride] += s * 1.828183197857862944;
+                                    } break;
+                                    case 19: { // l=3, j=9
+                                        sph_out[3*j_stride] += s * 0.746352665180230782;
+                                    } break;
+                                    case 20: { // l=4, j=0
+                                        sph_out[4*j_stride] += s * 0.317356640745612911;
+                                        sph_out[6*j_stride] += s * -0.473087347878780002;
+                                        sph_out[8*j_stride] += s * 0.625835735449176134;
+                                    } break;
+                                    case 21: { // l=4, j=1
+                                        sph_out[0*j_stride] += s * 2.503342941796704538;
+                                        sph_out[2*j_stride] += s * -0.946174695757560014;
+                                    } break;
+                                    case 22: { // l=4, j=2
+                                        sph_out[5*j_stride] += s * -2.007139630671867500;
+                                        sph_out[7*j_stride] += s * 1.770130769779930531;
+                                    } break;
+                                    case 23: { // l=4, j=3
+                                        sph_out[4*j_stride] += s * 0.634713281491225822;
+                                        sph_out[8*j_stride] += s * -3.755014412695056800;
+                                    } break;
+                                    case 24: { // l=4, j=4
+                                        sph_out[1*j_stride] += s * 5.310392309339791593;
+                                        sph_out[3*j_stride] += s * -2.007139630671867500;
+                                    } break;
+                                    case 25: { // l=4, j=5
+                                        sph_out[4*j_stride] += s * -2.538853125964903290;
+                                        sph_out[6*j_stride] += s * 2.838524087272680054;
+                                    } break;
+                                    case 26: { // l=4, j=6
+                                        sph_out[0*j_stride] += s * -2.503342941796704530;
+                                        sph_out[2*j_stride] += s * -0.946174695757560014;
+                                    } break;
+                                    case 27: { // l=4, j=7
+                                        sph_out[5*j_stride] += s * -2.007139630671867500;
+                                        sph_out[7*j_stride] += s * -5.310392309339791590;
+                                    } break;
+                                    case 28: { // l=4, j=8
+                                        sph_out[2*j_stride] += s * 5.677048174545360108;
+                                    } break;
+                                    case 29: { // l=4, j=9
+                                        sph_out[5*j_stride] += s * 2.676186174229156671;
+                                    } break;
+                                    case 30: { // l=4, j=10
+                                        sph_out[4*j_stride] += s * 0.317356640745612911;
+                                        sph_out[6*j_stride] += s * 0.473087347878780009;
+                                        sph_out[8*j_stride] += s * 0.625835735449176134;
+                                    } break;
+                                    case 31: { // l=4, j=11
+                                        sph_out[1*j_stride] += s * -1.770130769779930530;
+                                        sph_out[3*j_stride] += s * -2.007139630671867500;
+                                    } break;
+                                    case 32: { // l=4, j=12
+                                        sph_out[4*j_stride] += s * -2.538853125964903290;
+                                        sph_out[6*j_stride] += s * -2.838524087272680050;
+                                    } break;
+                                    case 33: { // l=4, j=13
+                                        sph_out[3*j_stride] += s * 2.676186174229156671;
+                                    } break;
+                                    case 34: { // l=4, j=14
+                                        sph_out[4*j_stride] += s * 0.846284375321634430;
+                                    } break;
+                                    case 35: { // l=5, j=0
+                                        sph_out[6*j_stride] += s * 0.452946651195696921;
+                                        sph_out[8*j_stride] += s * -0.489238299435250389;
+                                        sph_out[10*j_stride] += s * 0.656382056840170102;
+                                    } break;
+                                    case 36: { // l=5, j=1
+                                        sph_out[0*j_stride] += s * 3.281910284200850514;
+                                        sph_out[2*j_stride] += s * -1.467714898305751160;
+                                        sph_out[4*j_stride] += s * 0.452946651195696921;
+                                    } break;
+                                    case 37: { // l=5, j=2
+                                        sph_out[5*j_stride] += s * 1.754254836801353946;
+                                        sph_out[7*j_stride] += s * -2.396768392486661870;
+                                        sph_out[9*j_stride] += s * 2.075662314881041278;
+                                    } break;
+                                    case 38: { // l=5, j=3
+                                        sph_out[6*j_stride] += s * 0.905893302391393842;
+                                        sph_out[8*j_stride] += s * 0.978476598870500775;
+                                        sph_out[10*j_stride] += s * -6.563820568401701020;
+                                    } break;
+                                    case 39: { // l=5, j=4
+                                        sph_out[1*j_stride] += s * 8.302649259524165115;
+                                        sph_out[3*j_stride] += s * -4.793536784973323750;
+                                    } break;
+                                    case 40: { // l=5, j=5
+                                        sph_out[6*j_stride] += s * -5.435359814348363050;
+                                        sph_out[8*j_stride] += s * 3.913906395482003101;
+                                    } break;
+                                    case 41: { // l=5, j=6
+                                        sph_out[0*j_stride] += s * -6.563820568401701020;
+                                        sph_out[2*j_stride] += s * -0.978476598870500779;
+                                        sph_out[4*j_stride] += s * 0.905893302391393842;
+                                    } break;
+                                    case 42: { // l=5, j=7
+                                        sph_out[5*j_stride] += s * 3.508509673602707893;
+                                        sph_out[9*j_stride] += s * -12.453973889286247600;
+                                    } break;
+                                    case 43: { // l=5, j=8
+                                        sph_out[2*j_stride] += s * 11.741719186446009300;
+                                        sph_out[4*j_stride] += s * -5.435359814348363050;
+                                    } break;
+                                    case 44: { // l=5, j=9
+                                        sph_out[5*j_stride] += s * -4.678012898136943850;
+                                        sph_out[7*j_stride] += s * 4.793536784973323755;
+                                    } break;
+                                    case 45: { // l=5, j=10
+                                        sph_out[6*j_stride] += s * 0.452946651195696921;
+                                        sph_out[8*j_stride] += s * 1.467714898305751163;
+                                        sph_out[10*j_stride] += s * 3.281910284200850514;
+                                    } break;
+                                    case 46: { // l=5, j=11
+                                        sph_out[1*j_stride] += s * -8.302649259524165110;
+                                        sph_out[3*j_stride] += s * -4.793536784973323750;
+                                    } break;
+                                    case 47: { // l=5, j=12
+                                        sph_out[6*j_stride] += s * -5.435359814348363050;
+                                        sph_out[8*j_stride] += s * -11.741719186446009300;
+                                    } break;
+                                    case 48: { // l=5, j=13
+                                        sph_out[3*j_stride] += s * 9.587073569946647510;
+                                    } break;
+                                    case 49: { // l=5, j=14
+                                        sph_out[6*j_stride] += s * 3.623573209565575370;
+                                    } break;
+                                    case 50: { // l=5, j=15
+                                        sph_out[0*j_stride] += s * 0.656382056840170102;
+                                        sph_out[2*j_stride] += s * 0.489238299435250387;
+                                        sph_out[4*j_stride] += s * 0.452946651195696921;
+                                    } break;
+                                    case 51: { // l=5, j=16
+                                        sph_out[5*j_stride] += s * 1.754254836801353946;
+                                        sph_out[7*j_stride] += s * 2.396768392486661877;
+                                        sph_out[9*j_stride] += s * 2.075662314881041278;
+                                    } break;
+                                    case 52: { // l=5, j=17
+                                        sph_out[2*j_stride] += s * -3.913906395482003100;
+                                        sph_out[4*j_stride] += s * -5.435359814348363050;
+                                    } break;
+                                    case 53: { // l=5, j=18
+                                        sph_out[5*j_stride] += s * -4.678012898136943850;
+                                        sph_out[7*j_stride] += s * -4.793536784973323750;
+                                    } break;
+                                    case 54: { // l=5, j=19
+                                        sph_out[4*j_stride] += s * 3.623573209565575370;
+                                    } break;
+                                    case 55: { // l=5, j=20
+                                        sph_out[5*j_stride] += s * 0.935602579627388771;
+                                    } break;
+                                    case 56: { // l=6, j=0
+                                        sph_out[6*j_stride] += s * -0.3178460113381421;
+                                        sph_out[8*j_stride] += s * 0.4606026297574618;
+                                        sph_out[10*j_stride] += s * -0.5045649007287241;
+                                        sph_out[12*j_stride] += s * 0.6831841051919144;
+                                    } break;
+                                    case 57: { // l=6, j=1
+                                        sph_out[0*j_stride] += s * 4.0991046311514863;
+                                        sph_out[2*j_stride] += s * -2.0182596029148963;
+                                        sph_out[4*j_stride] += s * 0.9212052595149236;
+                                    } break;
+                                    case 58: { // l=6, j=2
+                                        sph_out[7*j_stride] += s * 2.9131068125936568;
+                                        sph_out[9*j_stride] += s * -2.7636157785447706;
+                                        sph_out[11*j_stride] += s * 2.3666191622317525;
+                                    } break;
+                                    case 59: { // l=6, j=3
+                                        sph_out[6*j_stride] += s * -0.9535380340144264;
+                                        sph_out[8*j_stride] += s * 0.4606026297574618;
+                                        sph_out[10*j_stride] += s * 2.5228245036436201;
+                                        sph_out[12*j_stride] += s * -10.2477615778787161;
+                                    } break;
+                                    case 60: { // l=6, j=4
+                                        sph_out[1*j_stride] += s * 11.8330958111587634;
+                                        sph_out[3*j_stride] += s * -8.2908473356343109;
+                                        sph_out[5*j_stride] += s * 2.9131068125936568;
+                                    } break;
+                                    case 61: { // l=6, j=5
+                                        sph_out[6*j_stride] += s * 5.7212282040865583;
+                                        sph_out[8*j_stride] += s * -7.3696420761193888;
+                                        sph_out[10*j_stride] += s * 5.0456490072872420;
+                                    } break;
+                                    case 62: { // l=6, j=6
+                                        sph_out[0*j_stride] += s * -13.6636821038382887;
+                                        sph_out[4*j_stride] += s * 1.8424105190298472;
+                                    } break;
+                                    case 63: { // l=6, j=7
+                                        sph_out[7*j_stride] += s * 5.8262136251873136;
+                                        sph_out[9*j_stride] += s * 5.5272315570895412;
+                                        sph_out[11*j_stride] += s * -23.6661916223175268;
+                                    } break;
+                                    case 64: { // l=6, j=8
+                                        sph_out[2*j_stride] += s * 20.1825960291489679;
+                                        sph_out[4*j_stride] += s * -14.7392841522387776;
+                                    } break;
+                                    case 65: { // l=6, j=9
+                                        sph_out[7*j_stride] += s * -11.6524272503746271;
+                                        sph_out[9*j_stride] += s * 7.3696420761193888;
+                                    } break;
+                                    case 66: { // l=6, j=10
+                                        sph_out[6*j_stride] += s * -0.9535380340144264;
+                                        sph_out[8*j_stride] += s * -0.4606026297574618;
+                                        sph_out[10*j_stride] += s * 2.5228245036436201;
+                                        sph_out[12*j_stride] += s * 10.2477615778787161;
+                                    } break;
+                                    case 67: { // l=6, j=11
+                                        sph_out[1*j_stride] += s * -23.6661916223175268;
+                                        sph_out[3*j_stride] += s * -5.5272315570895412;
+                                        sph_out[5*j_stride] += s * 5.8262136251873136;
+                                    } break;
+                                    case 68: { // l=6, j=12
+                                        sph_out[6*j_stride] += s * 11.4424564081731166;
+                                        sph_out[10*j_stride] += s * -30.2738940437234518;
+                                    } break;
+                                    case 69: { // l=6, j=13
+                                        sph_out[3*j_stride] += s * 22.1089262283581647;
+                                        sph_out[5*j_stride] += s * -11.6524272503746271;
+                                    } break;
+                                    case 70: { // l=6, j=14
+                                        sph_out[6*j_stride] += s * -7.6283042721154111;
+                                        sph_out[8*j_stride] += s * 7.3696420761193888;
+                                    } break;
+                                    case 71: { // l=6, j=15
+                                        sph_out[0*j_stride] += s * 4.0991046311514863;
+                                        sph_out[2*j_stride] += s * 2.0182596029148963;
+                                        sph_out[4*j_stride] += s * 0.9212052595149236;
+                                    } break;
+                                    case 72: { // l=6, j=16
+                                        sph_out[7*j_stride] += s * 2.9131068125936568;
+                                        sph_out[9*j_stride] += s * 8.2908473356343109;
+                                        sph_out[11*j_stride] += s * 11.8330958111587634;
+                                    } break;
+                                    case 73: { // l=6, j=17
+                                        sph_out[2*j_stride] += s * -20.1825960291489679;
+                                        sph_out[4*j_stride] += s * -14.7392841522387776;
+                                    } break;
+                                    case 74: { // l=6, j=18
+                                        sph_out[7*j_stride] += s * -11.6524272503746271;
+                                        sph_out[9*j_stride] += s * -22.1089262283581647;
+                                    } break;
+                                    case 75: { // l=6, j=19
+                                        sph_out[4*j_stride] += s * 14.7392841522387776;
+                                    } break;
+                                    case 76: { // l=6, j=20
+                                        sph_out[7*j_stride] += s * 4.6609709001498505;
+                                    } break;
+                                    case 77: { // l=6, j=21
+                                        sph_out[6*j_stride] += s * -0.3178460113381421;
+                                        sph_out[8*j_stride] += s * -0.4606026297574618;
+                                        sph_out[10*j_stride] += s * -0.5045649007287241;
+                                        sph_out[12*j_stride] += s * -0.6831841051919144;
+                                    } break;
+                                    case 78: { // l=6, j=22
+                                        sph_out[1*j_stride] += s * 2.3666191622317525;
+                                        sph_out[3*j_stride] += s * 2.7636157785447706;
+                                        sph_out[5*j_stride] += s * 2.9131068125936568;
+                                    } break;
+                                    case 79: { // l=6, j=23
+                                        sph_out[6*j_stride] += s * 5.7212282040865583;
+                                        sph_out[8*j_stride] += s * 7.3696420761193888;
+                                        sph_out[10*j_stride] += s * 5.0456490072872420;
+                                    } break;
+                                    case 80: { // l=6, j=24
+                                        sph_out[3*j_stride] += s * -7.3696420761193888;
+                                        sph_out[5*j_stride] += s * -11.6524272503746271;
+                                    } break;
+                                    case 81: { // l=6, j=25
+                                        sph_out[6*j_stride] += s * -7.6283042721154111;
+                                        sph_out[8*j_stride] += s * -7.3696420761193888;
+                                    } break;
+                                    case 82: { // l=6, j=26
+                                        sph_out[5*j_stride] += s * 4.6609709001498505;
+                                    } break;
+                                    case 83: { // l=6, j=27
+                                        sph_out[6*j_stride] += s * 1.0171072362820548;
+                                    } break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } // while (img_not_processed > 0)
+    _filter_ijk_tasks(rem_task_idx, num_ijk_tasks, ijk_tasks_info,
+                      (int *)shared_memory);
+    } // while (num_ijk_tasks > 0)
+}
+}
+
+__global__ static
+void ovlp_img_counts_kernel(int *img_counts, PBCIntEnvVars envs,
+                            float *exps, float *log_coef, float log_cutoff,
+                            int permutation_symmetry)
+{
+    int bas_ij = blockIdx.x * blockDim.x + threadIdx.x;
+    int bvk_nbas = envs.bvk_ncells * envs.nbas;
+    int ish = bas_ij / bvk_nbas;
+    int jsh = bas_ij - bvk_nbas * ish;
+    if (ish >= envs.nbas || jsh >= bvk_nbas) {
+        return;
+    }
+    int ish_cell0 = ish;
+    int jsh_cell0 = jsh % envs.nbas;
+    if (permutation_symmetry && ish_cell0 < jsh_cell0) {
+        return;
+    }
+    int nimgs = envs.nimgs;
+    int *atm = envs.atm;
+    int *bas = envs.bas;
+    double *env = envs.env;
+    double *img_coords = envs.img_coords;
+    int li = bas[ANG_OF + ish_cell0*BAS_SLOTS];
+    int lj = bas[ANG_OF + jsh_cell0*BAS_SLOTS];
+    float ai = exps[ish_cell0];
+    float aj = exps[jsh_cell0];
+    float aij = ai + aj;
+    float ai_aij = ai / aij;
+    float aj_aij = aj / aij;
+    float theta_ij = ai * aj / aij;
+    float log_ci = log_coef[ish_cell0];
+    float log_cj = log_coef[jsh_cell0];
+    float log_cicj = log_ci + log_cj;
+    double *ri = env + atm[bas[ish*BAS_SLOTS+ATOM_OF] * ATM_SLOTS + PTR_COORD];
+    double *rj = env + atm[bas[jsh*BAS_SLOTS+ATOM_OF] * ATM_SLOTS + PTR_COORD];
+    float xjxi = rj[0] - ri[0];
+    float yjyi = rj[1] - ri[1];
+    float zjzi = rj[2] - ri[2];
+    // log(ci*cj * (pi/aij)**1.5)
+    float log_fac = log_cicj + 1.717f - 1.5f*logf(aij);
+    // An addiitonal factor for Coulomb integrals
+    // log_fac += .25 * logf(2./pi * aij)
+    log_fac += .25f * logf(0.6366f * aij);
+    log_cutoff = log_cutoff - log_fac;
+
+    int counts = 0;
+    for (int img = 0; img < nimgs; ++img) {
+        float xjLxi = xjxi + img_coords[img*3+0];
+        float yjLyi = yjyi + img_coords[img*3+1];
+        float zjLzi = zjzi + img_coords[img*3+2];
+        float rr_ij = xjLxi * xjLxi + yjLyi * yjLyi + zjLzi * zjLzi;
+        float theta_ij_rr = theta_ij * rr_ij;
+        if (theta_ij_rr > REMOTE_THRESHOLD) {
+            continue;
+        }
+        float dr = sqrtf(rr_ij);
+        float dri = aj_aij * dr;
+        float drj = ai_aij * dr;
+        float dri_fac = .5f*li * logf(.5f*li/aij + dri*dri + 1e-9f);
+        float drj_fac = .5f*lj * logf(.5f*lj/aij + drj*drj + 1e-9f);
+        float estimator = dri_fac + drj_fac - theta_ij_rr;
+        if (estimator > log_cutoff) {
+            counts++;
+        }
+    }
+    img_counts[bas_ij] = counts;
+}
+
+__global__ static
+void ovlp_img_idx_kernel(int *img_idx, uint32_t *img_offsets, uint32_t *bas_ij_idx, int npairs,
+                         PBCIntEnvVars envs, float *exps, float *log_coef, float log_cutoff)
+{
+    int pair_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair_id >= npairs) {
+        return;
+    }
+    uint32_t bas_ij = bas_ij_idx[pair_id];
+    int bvk_nbas = envs.bvk_ncells * envs.nbas;
+    int ish = bas_ij / bvk_nbas;
+    int jsh = bas_ij - bvk_nbas * ish;
+    int ish_cell0 = ish;
+    int jsh_cell0 = jsh % envs.nbas;
+    int nimgs = envs.nimgs;
+    int *atm = envs.atm;
+    int *bas = envs.bas;
+    double *env = envs.env;
+    double *img_coords = envs.img_coords;
+    int li = bas[ANG_OF + ish_cell0*BAS_SLOTS];
+    int lj = bas[ANG_OF + jsh_cell0*BAS_SLOTS];
+    float ai = exps[ish_cell0];
+    float aj = exps[jsh_cell0];
+    float aij = ai + aj;
+    float ai_aij = ai / aij;
+    float aj_aij = aj / aij;
+    float theta_ij = ai * aj / aij;
+    float log_ci = log_coef[ish_cell0];
+    float log_cj = log_coef[jsh_cell0];
+    float log_cicj = log_ci + log_cj;
+    double *ri = env + atm[bas[ish*BAS_SLOTS+ATOM_OF] * ATM_SLOTS + PTR_COORD];
+    double *rj = env + atm[bas[jsh*BAS_SLOTS+ATOM_OF] * ATM_SLOTS + PTR_COORD];
+    float xjxi = rj[0] - ri[0];
+    float yjyi = rj[1] - ri[1];
+    float zjzi = rj[2] - ri[2];
+    // log(ci*cj * (pi/aij)**1.5)
+    float log_fac = log_cicj + 1.717f - 1.5f*logf(aij);
+    // An addiitonal factor for Coulomb integrals
+    // log_fac += .25 * logf(2./pi * aij)
+    log_fac += .25f * logf(0.6366f * aij);
+    log_cutoff = log_cutoff - log_fac;
+
+    int counts = img_offsets[pair_id];
+    for (int img = 0; img < nimgs; ++img) {
+        float xjLxi = xjxi + img_coords[img*3+0];
+        float yjLyi = yjyi + img_coords[img*3+1];
+        float zjLzi = zjzi + img_coords[img*3+2];
+        float rr_ij = xjLxi * xjLxi + yjLyi * yjLyi + zjLzi * zjLzi;
+        float theta_ij_rr = theta_ij * rr_ij;
+        if (theta_ij_rr > REMOTE_THRESHOLD) {
+            continue;
+        }
+        float dr = sqrtf(rr_ij);
+        float dri = aj_aij * dr;
+        float drj = ai_aij * dr;
+        float dri_fac = .5f*li * logf(.5f*li/aij + dri*dri + 1e-9f);
+        float drj_fac = .5f*lj * logf(.5f*lj/aij + drj*drj + 1e-9f);
+        float estimator = dri_fac + drj_fac - theta_ij_rr;
+        if (estimator > log_cutoff) {
+            img_idx[counts] = img;
+            counts++;
+        }
+    }
+}
+
+extern "C" {
+int PBCsr_int3c2e_latsum23(double *out, PBCIntEnvVars *envs, uint32_t *pool,
+                           ShellTripletTaskInfo *task_pool, double *c2s_pool, int *head,
+                           int shm_size, int nbatches_shl_pair, int nbatches_ksh,
+                           uint32_t *bas_ij_idx, int *shl_pair_offsets, int *ksh_offsets,
+                           int *img_idx, uint32_t *sp_img_offsets,
+                           int *gout_stride_lookup, int *ao_pair_loc,
+                           int ao_pair_offset, int nao_pairs,
+                           int aux_offset, int nauxbas, int naux, int to_sph,
+                           float *diffuse_exps, float *diffuse_coefs, float log_cutoff)
+{
+    hipFuncSetAttribute(reinterpret_cast<const void*>(pbc_int3c2e_latsum23_kernel), hipFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    hipDeviceProp_t prop;
+    hipGetDeviceProperties(&prop, 0);
+    int workers = prop.multiProcessorCount;
+    hipMemset(head, 0, sizeof(int));
+    pbc_int3c2e_latsum23_kernel<<<workers, THREADS, shm_size>>>(
+            out, *envs, pool, task_pool, c2s_pool, shm_size,
+            bas_ij_idx, shl_pair_offsets, ksh_offsets, img_idx, sp_img_offsets,
+            gout_stride_lookup, ao_pair_loc,
+            ao_pair_offset, aux_offset, nauxbas, naux, to_sph,
+            diffuse_exps, diffuse_coefs, log_cutoff,
+            head, nbatches_shl_pair, nbatches_ksh);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "CUDA Error in fill_int3c2e: %s\n", hipGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+int bvk_ovlp_img_counts(int *img_counts, PBCIntEnvVars *envs,
+                        float *exps, float *log_coef, float log_cutoff,
+                        int permutation_symmetry)
+{
+    constexpr int threads = 512;
+    int bvk_nbas = envs->nbas * envs->bvk_ncells;
+    int nbatches = (envs->nbas * bvk_nbas + threads-1) / threads;
+    ovlp_img_counts_kernel<<<nbatches, threads>>>(
+            img_counts, *envs, exps, log_coef, log_cutoff, permutation_symmetry);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "CUDA Error in bvk_ovlp_img_counts: %s\n", hipGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+int bvk_ovlp_img_idx(int *img_idx, uint32_t *img_offsets, uint32_t *bas_ij_idx, int npairs,
+                     PBCIntEnvVars *envs, float *exps, float *log_coef, float log_cutoff)
+{
+    constexpr int threads = 512;
+    int blocks = (npairs + threads-1) / threads;
+    ovlp_img_idx_kernel<<<blocks, threads>>>(
+        img_idx, img_offsets, bas_ij_idx, npairs, *envs, exps, log_coef, log_cutoff);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "CUDA Error in bvk_ovlp_img_idx: %s\n", hipGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+}

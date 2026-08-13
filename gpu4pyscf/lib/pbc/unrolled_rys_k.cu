@@ -1,11 +1,11 @@
 
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include "gvhf-rys/vhf.cuh"
-#include "gvhf-rys/rys_roots_for_k.cu"
-#include "gvhf-rys/rys_contract_k.cuh"
-#include "pbc/create_tasks.cu"
-#include "pbc/unrolled_kernels.cuh"
+#include <hip/hip_runtime.h>
+#include <hip/hip_runtime.h>
+#include "gvhf-rys/vhf.h"
+#include "gvhf-rys/rys_roots_for_k.hip"
+#include "gvhf-rys/rys_contract_k.h"
+#include "pbc/create_tasks.hip"
+#include "pbc/unrolled_kernels.h"
 
 
 __global__ static

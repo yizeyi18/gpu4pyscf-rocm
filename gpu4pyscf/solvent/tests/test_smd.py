@@ -19,6 +19,12 @@ import pyscf
 from pyscf import gto
 from gpu4pyscf import scf, dft
 from gpu4pyscf.solvent import smd
+try:
+    from pyscf.solvent import smd as _smd_cpu
+    HAS_PYSCF_SMD = getattr(_smd_cpu, 'libsolvent', None) is not None
+except ImportError:
+    HAS_PYSCF_SMD = False
+
 from packaging import version
 
 pyscf_211 = version.parse(pyscf.__version__) <= version.parse('2.11.0')
@@ -296,6 +302,7 @@ H -0.646 -0.464 -0.804
     """
 
     @unittest.skipIf(pyscf_211, 'requires pyscf 2.11 or higher')
+    @unittest.skipUnless(HAS_PYSCF_SMD, "pyscf built without the SMD module (ENABLE_SMD=ON)")
     def test_to_gpu_to_cpu(self):
         mf = dft.RKS(mol, xc='b3lyp').SMD()
         e_gpu = mf.kernel()

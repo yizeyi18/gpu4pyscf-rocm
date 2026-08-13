@@ -13,7 +13,45 @@
 # limitations under the License.
 
 cmake_minimum_required (VERSION 3.19 FATAL_ERROR) # 3.19 is required by cutlass
-project (gpu4pyscf C CXX CUDA Fortran)
+project (gpu4pyscf C CXX Fortran)
+
+set(GPU4PYSCF_GPU_BACKEND "HIP" CACHE STRING "GPU backend to build (CUDA or HIP)")
+set_property(CACHE GPU4PYSCF_GPU_BACKEND PROPERTY STRINGS "CUDA" "HIP")
+string(TOUPPER "${GPU4PYSCF_GPU_BACKEND}" GPU4PYSCF_GPU_BACKEND_UPPER)
+
+set(GPU4PYSCF_USE_CUDA OFF)
+set(GPU4PYSCF_USE_HIP OFF)
+if (GPU4PYSCF_GPU_BACKEND_UPPER STREQUAL "CUDA")
+  set(GPU4PYSCF_USE_CUDA ON)
+elseif (GPU4PYSCF_GPU_BACKEND_UPPER STREQUAL "HIP")
+  set(GPU4PYSCF_USE_HIP ON)
+else()
+  message(FATAL_ERROR "Unsupported GPU backend '${GPU4PYSCF_GPU_BACKEND}'. Choose CUDA or HIP.")
+endif()
+
+if (GPU4PYSCF_USE_CUDA)
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "70-real;80-real;90-real")
+  endif()
+  message(STATUS "Configuring gpu4pyscf with CUDA backend")
+  message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+  set(GPU4PYSCF_GPU_SOURCE_EXTENSION "cu")
+  set(GPU4PYSCF_DEVICE_LIB CUDA::cudart)
+  set(GPU4PYSCF_HOST_LIB CUDA::cudart)
+else()
+  enable_language(HIP)
+  find_package(hip REQUIRED)
+  if (NOT DEFINED CMAKE_HIP_ARCHITECTURES)
+    set(CMAKE_HIP_ARCHITECTURES "gfx906")
+  endif()
+  message(STATUS "Configuring gpu4pyscf with HIP backend")
+  message(STATUS "HIP architectures: ${CMAKE_HIP_ARCHITECTURES}")
+  set(GPU4PYSCF_GPU_SOURCE_EXTENSION "hip")
+  set(GPU4PYSCF_DEVICE_LIB hip::device)
+  set(GPU4PYSCF_HOST_LIB hip::host)
+endif()
 
 set(CMAKE_C_STANDARD "99")
 set(CMAKE_CXX_STANDARD 17)
@@ -21,9 +59,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # For better performance on A100, the option
 # -DCUDA_ARCHITECTURES="70-real;80-real" can be added to cmake command
-if(DEFINED CUDA_ARCHITECTURES)
+if(DEFINED CUDA_ARCHITECTURES AND GPU4PYSCF_USE_CUDA)
   set(CMAKE_CUDA_ARCHITECTURES "${CUDA_ARCHITECTURES}")
-else()
+elseif(GPU4PYSCF_USE_CUDA)
   set(CMAKE_CUDA_ARCHITECTURES "70-real;80-real;90-real")
 endif()
 message("CUDA_ARCHITECTURES: ${CMAKE_CUDA_ARCHITECTURES}")
@@ -97,13 +135,11 @@ include_directories(${PROJECT_SOURCE_DIR})
 include_directories(${PROJECT_SOURCE_DIR}/deps/include)
 link_directories(${PROJECT_SOURCE_DIR}/deps/lib)
 
-#list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
-
 set(C_LINK_TEMPLATE "<CMAKE_C_COMPILER> <CMAKE_SHARED_LIBRARY_C_FLAGS> <LANGUAGE_COMPILE_FLAGS> <LINK_FLAGS> <CMAKE_SHARED_LIBRARY_CREATE_C_FLAGS> -o <TARGET> <OBJECTS> <LINK_LIBRARIES>")
 set(CXX_LINK_TEMPLATE "<CMAKE_CXX_COMPILER> <CMAKE_SHARED_LIBRARY_CXX_FLAGS> <LANGUAGE_COMPILE_FLAGS> <LINK_FLAGS> <CMAKE_SHARED_LIBRARY_CREATE_CXX_FLAGS> -o <TARGET> <OBJECTS> <LINK_LIBRARIES>")
 
 option(BUILD_CUTLASS "Using cutlass" ON)
-if(BUILD_CUTLASS)
+if(BUILD_CUTLASS AND GPU4PYSCF_USE_CUDA)
   include(ExternalProject)
   ExternalProject_Add(cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
@@ -117,6 +153,8 @@ if(BUILD_CUTLASS)
   # ExternalProject_Add automatically populates this variable
   ExternalProject_Get_Property(cutlass SOURCE_DIR)
   set(cutlass_SOURCE_DIR ${SOURCE_DIR})
+elseif(BUILD_CUTLASS AND GPU4PYSCF_USE_HIP)
+  message(STATUS "BUILD_CUTLASS is ignored for the HIP backend")
 endif()
 
 add_subdirectory(gint)

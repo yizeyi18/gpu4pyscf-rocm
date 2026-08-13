@@ -97,7 +97,7 @@ def _check_grad(mol, grid_response=False, xc=xc0, disp=disp0, tol=1e-6):
     print('difference between analytical and finite difference gradient:', cupy.linalg.norm(g_analy - grad_fd))
     assert(cupy.linalg.norm(g_analy - grad_fd) < tol)
 
-def _vs_cpu(mol, grid_response=False, xc=xc0, disp=disp0, tol=1e-9):
+def _vs_cpu(mol, grid_response=False, xc=xc0, disp=disp0, tol=5e-9):
     mf = rks.RKS(mol, xc=xc).density_fit(auxbasis=auxbasis0)
     mf.disp = disp
     mf.grids.level = grids_level

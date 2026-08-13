@@ -22,7 +22,13 @@ from gpu4pyscf.lib.cupy_helper import (
     add_sparse, takebak, empty_mapped, dist_matrix,
     grouped_dot, grouped_gemm, cond, cart2sph_cutensor, cart2sph,
     copy_array)
-from gpu4pyscf.lib import cusolver
+if not cupy.cuda.runtime.is_hip:
+    from gpu4pyscf.lib import cusolver
+else:
+    from gpu4pyscf.lib import rocsolver as cusolver
+
+# grouped_dot/grouped_gemm are built only when cutlass is available (CUDA only)
+HAS_CUTLASS = hasattr(cupy_helper.libcupy_helper, 'grouped_dot')
 
 class KnownValues(unittest.TestCase):
     def test_take_last2d(self):
@@ -117,6 +123,7 @@ class KnownValues(unittest.TestCase):
         cond_gpu = cond(a)
         assert abs(cond_cpu - cond_gpu) < 1e-5
 
+    @unittest.skipUnless(HAS_CUTLASS, "cutlass grouped gemm not available")
     def test_grouped_dot(self):
         dtype = cupy.float64
         def initialize(dtype, M, N, K):
@@ -152,6 +159,7 @@ class KnownValues(unittest.TestCase):
         assert(cupy.linalg.norm(res_Cs - ans_Cs) < 1e-8)
         assert(cupy.linalg.norm(res_Cs_2 - ans_Cs) < 1e-8)
 
+    @unittest.skipUnless(HAS_CUTLASS, "cutlass grouped gemm not available")
     def test_grouped_gemm(self):
         dtype = cupy.float64
         def initialize(dtype, M, N, K):

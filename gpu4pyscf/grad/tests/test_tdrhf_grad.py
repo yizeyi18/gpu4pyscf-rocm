@@ -318,8 +318,8 @@ class KnownValues(unittest.TestCase):
             unit='B',)
         mf = mol.RHF().to_gpu()
         nao = mol.nao
-        cp.random.seed(4)
-        c = cp.random.rand(nao, nao) - .5
+        np.random.seed(4)
+        c = cp.asarray(np.random.rand(nao, nao)) - .5
         s = mf.get_ovlp()
         diag = cp.einsum('pi,pq,qi->i', c, s, c)
         mf.mo_coeff = c / diag**.5

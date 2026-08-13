@@ -319,8 +319,10 @@ class KnownValues(unittest.TestCase):
             unit='B',)
         mf = mol.RHF().to_gpu()
         nao = mol.nao
-        cp.random.seed(4)
-        c = cp.random.rand(nao, nao) - .5
+        np.random.seed(4)
+        # rndgen changed from cp to np
+        # TODO: recalc reference value
+        c = cp.asarray(np.random.rand(nao, nao)) - .5
         s = mf.get_ovlp()
         diag = cp.einsum('pi,pq,qi->i', c, s, c)
         mf.mo_coeff = c / diag**.5
@@ -329,7 +331,9 @@ class KnownValues(unittest.TestCase):
         nocc = 5
         nvir = nao - nocc
         mf.mo_occ[:nocc] = 2
-        xyI, xyJ = cp.random.rand(2, 2, nocc, nvir) - .5
+        # rndgen changed from cp to np
+        # TODO: recalc reference value
+        xyI, xyJ = cp.asarray(np.random.rand(2, 2, nocc, nvir)) - .5
         xyI /= cp.linalg.norm(xyI)
         td_nac = mf.TDHF().NAC()
         td_nac.cphf_max_cycle = 1

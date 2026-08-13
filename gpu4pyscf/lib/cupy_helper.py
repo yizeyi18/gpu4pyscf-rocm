@@ -23,7 +23,10 @@ import cupy
 from pyscf import lib
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib.cutensor import contract
-from gpu4pyscf.lib import cusolver
+if cupy.cuda.runtime.is_hip:
+    from gpu4pyscf.lib import rocsolver as cusolver
+else:
+    from gpu4pyscf.lib import cusolver
 from gpu4pyscf.lib.memcpy import copy_array, p2p_transfer  #NOQA
 from gpu4pyscf.lib import multi_gpu
 from gpu4pyscf.lib.utils import load_library
@@ -51,7 +54,9 @@ def pin_memory(array):
     return ret
 
 def release_gpu_stack():
-    cupy.cuda.runtime.deviceSetLimit(0x00, 128)
+    # cudaLimitStackSize is not supported by the HIP runtime
+    if not cupy.cuda.runtime.is_hip:
+        cupy.cuda.runtime.deviceSetLimit(0x00, 128)
 
 def print_mem_info():
     mempool = cupy.get_default_memory_pool()

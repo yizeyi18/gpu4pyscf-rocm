@@ -17,6 +17,7 @@ PCM family solvent model
 '''
 # pylint: disable=C0103
 import ctypes
+import inspect
 from packaging.version import Version
 import numpy
 import cupy
@@ -413,7 +414,8 @@ def left_solve_K_IEFPCM(surface, _intermediates, right_vector, conv_tol = 1e-10,
                                       dtype = right_vector.dtype)
     b = right_vector.reshape(n)
     x0 = _K_preconditioner(b)
-    if Version(cupy.__version__) < Version("14.0.0"):
+    # cupy 14 renamed the gmres tolerance keyword from 'tol' to 'rtol'/'atol'
+    if 'tol' in inspect.signature(gmres).parameters:
         solution, info = gmres(operator_K, b, x0, tol = conv_tol, M = preconditioner_K, maxiter = 100)
     else:
         solution, info = gmres(operator_K, b, x0, rtol = 0, atol = conv_tol, M = preconditioner_K, maxiter = 100)

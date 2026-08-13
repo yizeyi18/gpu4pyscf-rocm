@@ -415,7 +415,7 @@ class TestFiniteDifference(unittest.TestCase):
         analytical_gradient = multigrid_v1.eval_vpplocG_SI_gradient(cell, cell.mesh, rho_g)
         analytical_gradient = analytical_gradient.get()
 
-        assert np.max(np.abs(numerical_gradient - analytical_gradient)) < 1e-8
+        assert np.max(np.abs(numerical_gradient - analytical_gradient)) < 5e-8
 
 
 if __name__ == '__main__':

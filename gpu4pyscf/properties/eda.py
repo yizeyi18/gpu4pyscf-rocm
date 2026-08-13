@@ -31,6 +31,7 @@ from gpu4pyscf.lib import logger
 import time
 import warnings
 from packaging.version import Version
+import inspect
 
 # np.set_printoptions(linewidth = np.iinfo(np.int32).max, threshold = np.iinfo(np.int32).max, precision = 16, suppress = True)
 
@@ -440,7 +441,8 @@ def get_eda_electrostatic_energy(mf_list, _make_mf, eda_cache, build_orbital_hes
                                              matvec = left_multiple_orbital_hessian,
                                              dtype = orbital_gradient.dtype)
 
-            if Version(cp.__version__) < Version("14.0.0"):
+            #if Version(cp.__version__) < Version("14.0.0"):
+            if 'tol' in inspect.signature(cg).parameters:
                 newton_direction, conjugate_gradient_info = cg(orbital_hessian,
                                                                orbital_gradient,
                                                                conjugate_gradient_initial_guess,

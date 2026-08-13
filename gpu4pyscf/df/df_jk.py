@@ -580,6 +580,12 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True, omega=None):
     return vj, vk
 
 def get_j(dfobj, dm, hermi=1):
+    if cp.cuda.runtime.is_hip:
+    # NOTE (ROCm port): the j_engine path (gvhf-md based 3c2e kernels)
+    # produces wrong results with diffuse basis functions on HIP.
+    # The cderi-based path (get_jk with with_k=False) is used instead.
+        vj, vk = get_jk(dfobj, dm, hermi, with_j=True, with_k=False)
+        return vj
     from gpu4pyscf.df.int3c2e_bdiv import int2c2e
     from gpu4pyscf.df import j_engine_3c2e
     if dfobj.intopt is None:

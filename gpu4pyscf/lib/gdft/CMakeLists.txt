@@ -12,16 +12,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --ptxas-options=-v")# -maxrregcount=128")
+if(GPU4PYSCF_USE_CUDA)
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --ptxas-options=-v")
+endif()
 
-add_library(gdft SHARED
-  nr_eval_gto.cu
-  contract_rho.cu
-  gen_grids.cu
-  nr_numint_sparse.cu
-  vv10.cu
-  libxc.cu
+set(gdft_gpu_sources_base
+  nr_eval_gto
+  contract_rho
+  gen_grids
+  nr_numint_sparse
+  vv10
+  libxc
 )
 
+set(gdft_gpu_sources "")
+foreach(src ${gdft_gpu_sources_base})
+  list(APPEND gdft_gpu_sources "${src}.${GPU4PYSCF_GPU_SOURCE_EXTENSION}")
+endforeach()
+
+if(GPU4PYSCF_USE_HIP)
+  set_source_files_properties(${gdft_gpu_sources} PROPERTIES LANGUAGE HIP)
+endif()
+
+add_library(gdft SHARED ${gdft_gpu_sources})
+
 set_target_properties(gdft PROPERTIES
-  LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR})
+  LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}
+)
+
+if(GPU4PYSCF_USE_CUDA)
+  set_property(TARGET gdft PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+endif()
+if(GPU4PYSCF_USE_HIP)
+  set_property(TARGET gdft PROPERTY HIP_SEPARABLE_COMPILATION ON)
+  target_compile_options(gdft PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-fgpu-rdc>)
+  target_link_options(gdft PRIVATE -fgpu-rdc)
+endif()
+
+if(GPU4PYSCF_DEVICE_LIB)
+  target_link_libraries(gdft PRIVATE ${GPU4PYSCF_DEVICE_LIB})
+endif()
+if(GPU4PYSCF_HOST_LIB)
+  target_link_libraries(gdft INTERFACE ${GPU4PYSCF_HOST_LIB})
+endif()

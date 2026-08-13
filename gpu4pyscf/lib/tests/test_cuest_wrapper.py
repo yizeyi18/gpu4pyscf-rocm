@@ -34,6 +34,7 @@ import numpy as np
 import cupy as cp
 
 @pytest.mark.special
+@unittest.skipIf(apply_cuest_wrapper is None, "cuest is not available")
 class KnownValues(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

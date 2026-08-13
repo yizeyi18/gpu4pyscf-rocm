@@ -20,6 +20,12 @@ from pyscf import gto
 from gpu4pyscf import scf, dft
 from gpu4pyscf.solvent.grad import smd as smd_grad
 from gpu4pyscf.solvent import smd
+try:
+    from pyscf.solvent import smd as _smd_cpu
+    HAS_PYSCF_SMD = getattr(_smd_cpu, 'libsolvent', None) is not None
+except ImportError:
+    HAS_PYSCF_SMD = False
+
 from packaging.version import Version
 
 pyscf_211 = Version(pyscf.__version__) <= Version('2.11.0')
@@ -246,6 +252,7 @@ H -0.646 -0.464 -0.804
         _check_grad(atom, solvent='water')
         _check_grad(atom, solvent='toluene')
 
+    @unittest.skipUnless(HAS_PYSCF_SMD, "pyscf built without the SMD module (ENABLE_SMD=ON)")
     def test_to_gpu(self):
         mf = mol.RKS(xc='b3lyp').SMD()
         if Version(pyscf.__version__) <= Version('2.11.0'):

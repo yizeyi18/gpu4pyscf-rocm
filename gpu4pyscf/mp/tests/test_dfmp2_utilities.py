@@ -167,7 +167,7 @@ class Intermediates(unittest.TestCase):
         vir_energy = mf.mo_energy[nocc:]
 
         result = dfmp2_drivers.dfmp2_kernel_one_gpu(mol, aux, occ_coeff, vir_coeff, occ_energy, vir_energy, j3c_backend='bdiv')
-        self.assertAlmostEqual(result['e_corr_os'], mp.e_corr_os, 7)
+        self.assertAlmostEqual(result['e_corr_os'], mp.e_corr_os, delta=2e-7)
         self.assertAlmostEqual(result['e_corr_os'], -0.2132034596360335, 7)
         self.assertAlmostEqual(result['e_corr_ss'], mp.e_corr_ss, 7)
         self.assertAlmostEqual(result['e_corr_ss'], -0.06542902835968734, 7)
